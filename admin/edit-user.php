@@ -16,12 +16,16 @@ try {
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
 $success = ''; $error = '';
+$active_tab = 'settings'; // Default tab
 $user_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 
 if (!$user_id) { header("Location: users.php"); exit; }
 
-// --- HANDLE FORM SUBMISSION (SETTINGS UPDATE) ---
+// --- HANDLE POST: SETTINGS & BILLING UPDATE ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_user'])) {
+    $active_tab = 'settings';
+    
+    // Core User Details
     $first_name = filter_input(INPUT_POST, 'first_name', FILTER_SANITIZE_SPECIAL_CHARS);
     $last_name = filter_input(INPUT_POST, 'last_name', FILTER_SANITIZE_SPECIAL_CHARS);
     $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
@@ -29,32 +33,191 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_user'])) {
     $wallet_balance = filter_input(INPUT_POST, 'wallet_balance', FILTER_VALIDATE_FLOAT);
     $new_password = $_POST['new_password'] ?? '';
 
+    // Billing Profile Details
+    $billing_type = filter_input(INPUT_POST, 'billing_type', FILTER_SANITIZE_SPECIAL_CHARS) ?: 'individual';
+    $company_name = filter_input(INPUT_POST, 'company_name', FILTER_SANITIZE_SPECIAL_CHARS);
+    $tax_id = filter_input(INPUT_POST, 'tax_id', FILTER_SANITIZE_SPECIAL_CHARS);
+    $billing_email = filter_input(INPUT_POST, 'billing_email', FILTER_SANITIZE_EMAIL) ?: $email;
+    $address_line1 = filter_input(INPUT_POST, 'address_line1', FILTER_SANITIZE_SPECIAL_CHARS);
+    $address_line2 = filter_input(INPUT_POST, 'address_line2', FILTER_SANITIZE_SPECIAL_CHARS);
+    $city = filter_input(INPUT_POST, 'city', FILTER_SANITIZE_SPECIAL_CHARS);
+    $state_province = filter_input(INPUT_POST, 'state_province', FILTER_SANITIZE_SPECIAL_CHARS);
+    $postal_code = filter_input(INPUT_POST, 'postal_code', FILTER_SANITIZE_SPECIAL_CHARS);
+    $country = filter_input(INPUT_POST, 'country', FILTER_SANITIZE_SPECIAL_CHARS);
+
     if (!$email) {
         $error = "A valid email address is required.";
     } elseif ($wallet_balance === false) {
         $error = "Invalid wallet balance amount.";
     } else {
         try {
+            $pdo->beginTransaction();
+
+            // 1. Check Email uniqueness
             $checkEmail = $pdo->prepare("SELECT id FROM users WHERE email = :email AND id != :id");
             $checkEmail->execute(['email' => $email, 'id' => $user_id]);
             if ($checkEmail->fetch()) {
-                $error = "This email is already in use by another client.";
-            } else {
-                $sql = "UPDATE users SET first_name = :fn, last_name = :ln, email = :email, theme = :theme, wallet_balance = :balance";
-                $params = ['fn' => $first_name, 'ln' => $last_name, 'email' => $email, 'theme' => in_array($theme, ['dark', 'light']) ? $theme : 'dark', 'balance' => $wallet_balance, 'id' => $user_id];
+                throw new Exception("This email is already in use by another client.");
+            } 
 
-                if (!empty($new_password)) {
-                    $sql .= ", password_hash = :pass";
-                    $params['pass'] = password_hash($new_password, PASSWORD_DEFAULT);
+            // 2. Update Core Users Table
+            $sql = "UPDATE users SET first_name = :fn, last_name = :ln, email = :email, theme = :theme, wallet_balance = :balance";
+            $params = ['fn' => $first_name, 'ln' => $last_name, 'email' => $email, 'theme' => in_array($theme, ['dark', 'light']) ? $theme : 'dark', 'balance' => $wallet_balance, 'id' => $user_id];
+            
+            if (!empty($new_password)) {
+                $sql .= ", password_hash = :pass";
+                $params['pass'] = password_hash($new_password, PASSWORD_DEFAULT);
+            }
+            $sql .= " WHERE id = :id";
+            $pdo->prepare($sql)->execute($params);
+
+            // 3. UPSERT User Billing Profile
+            $pdo->prepare("
+                INSERT INTO user_billing_profiles 
+                (user_id, billing_type, company_name, tax_id, billing_email, address_line1, address_line2, city, state_province, postal_code, country) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE 
+                billing_type = VALUES(billing_type), company_name = VALUES(company_name), tax_id = VALUES(tax_id), billing_email = VALUES(billing_email),
+                address_line1 = VALUES(address_line1), address_line2 = VALUES(address_line2), city = VALUES(city), state_province = VALUES(state_province),
+                postal_code = VALUES(postal_code), country = VALUES(country)
+            ")->execute([
+                $user_id, $billing_type, $company_name, $tax_id, $billing_email, 
+                $address_line1, $address_line2, $city, $state_province, $postal_code, $country
+            ]);
+
+            $pdo->commit();
+            $success = "Client core and billing profiles updated successfully.";
+
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $error = $e->getMessage() ?: "Database error while updating user.";
+        }
+    }
+}
+
+// --- HANDLE POST: BULK GENERATE INVOICES (PANELS) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_generate_invoices'])) {
+    $active_tab = 'panels';
+    $selected_panels = $_POST['selected_panels'] ?? [];
+    
+    if (!empty($selected_panels)) {
+        try {
+            $pdo->beginTransaction();
+            $generated = 0; $skipped = 0;
+            
+            foreach ($selected_panels as $pid) {
+                // Prevent duplicate Unpaid invoices for the same panel
+                $checkInv = $pdo->prepare("SELECT id FROM invoices WHERE panel_id = ? AND status = 'Unpaid' LIMIT 1");
+                $checkInv->execute([$pid]);
+                
+                if ($checkInv->fetch()) {
+                    $skipped++; continue;
                 }
 
-                $sql .= " WHERE id = :id";
-                $pdo->prepare($sql)->execute($params);
-                $success = "Client profile updated successfully.";
+                $stmt = $pdo->prepare("SELECT user_id, total_price, billing_cycle, expiry_date FROM user_panels WHERE id = ?");
+                $stmt->execute([$pid]);
+                $panel = $stmt->fetch();
+                
+                if ($panel) {
+                    $invoice_num = 'INV-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+                    $amount = $panel['total_price'] ?? 15.00;
+                    $due_date = date('Y-m-d', strtotime('+3 days'));
+                    
+                    // CALCULATE THE RECURRING PERIOD
+                    $cycle = $panel['billing_cycle'] ?? 'monthly';
+                    $current_expiry = $panel['expiry_date'];
+                    
+                    $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
+                    
+                    $months_to_add = 1;
+                    if ($cycle === 'quarterly') $months_to_add = 3;
+                    if ($cycle === 'semi_annually') $months_to_add = 6;
+                    if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
+                    
+                    $period_start = date('Y-m-d', $base_time);
+                    $period_end = date('Y-m-d', strtotime("+$months_to_add months", $base_time));
+                    
+                    // UPDATED: Now inserting with type = 'renew'
+                    $invStmt = $pdo->prepare("
+                        INSERT INTO invoices (user_id, panel_id, invoice_number, amount, type, status, due_date, period_start, period_end, created_at) 
+                        VALUES (?, ?, ?, ?, 'renew', 'Unpaid', ?, ?, ?, NOW())
+                    ");
+                    $invStmt->execute([
+                        $panel['user_id'], $pid, $invoice_num, $amount, $due_date, $period_start, $period_end
+                    ]);
+                    $generated++;
+                }
+            }
+            $pdo->commit();
+            
+            if ($generated > 0 && $skipped > 0) {
+                $success = "Generated $generated invoice(s). Skipped $skipped because they already have pending Unpaid invoices.";
+            } elseif ($generated > 0) {
+                $success = "Successfully generated $generated recurring unpaid invoice(s).";
+            } elseif ($skipped > 0) {
+                $error = "No invoices generated. All selected panels already have an existing Unpaid invoice.";
             }
         } catch (PDOException $e) {
-            $error = "Database error while updating user.";
+            $pdo->rollBack();
+            $error = "Database error generating recurring invoices.";
         }
+    } else {
+        $error = "Please select at least one panel.";
+    }
+}
+
+// --- HANDLE POST: BULK UPDATE INVOICE STATUS (Auto-Extend Logic) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_update_invoices'])) {
+    $active_tab = 'invoices';
+    $selected_invoices = $_POST['selected_invoices'] ?? [];
+    $new_status = filter_input(INPUT_POST, 'invoice_status', FILTER_SANITIZE_SPECIAL_CHARS);
+    $valid_inv_statuses = ['Paid', 'Unpaid', 'Cancelled'];
+    
+    if (!empty($selected_invoices) && in_array($new_status, $valid_inv_statuses)) {
+        try {
+            $processed = 0;
+            foreach ($selected_invoices as $inv_id) {
+                $pdo->beginTransaction();
+                
+                // IF MARKING AS PAID -> EXTEND PANEL EXPIRY
+                if ($new_status === 'Paid') {
+                    $chkStmt = $pdo->prepare("
+                        SELECT i.status, i.panel_id, p.billing_cycle, p.expiry_date 
+                        FROM invoices i 
+                        LEFT JOIN user_panels p ON i.panel_id = p.id 
+                        WHERE i.id = ?
+                    ");
+                    $chkStmt->execute([$inv_id]);
+                    $invData = $chkStmt->fetch();
+                    
+                    if ($invData && $invData['status'] !== 'Paid' && !empty($invData['panel_id'])) {
+                        $cycle = $invData['billing_cycle'] ?? 'monthly';
+                        $current_expiry = $invData['expiry_date'];
+                        
+                        $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
+                        
+                        $months_to_add = 1;
+                        if ($cycle === 'quarterly') $months_to_add = 3;
+                        if ($cycle === 'semi_annually') $months_to_add = 6;
+                        if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
+                        
+                        $new_expiry = date('Y-m-d H:i:s', strtotime("+$months_to_add months", $base_time));
+                        
+                        $pdo->prepare("UPDATE user_panels SET expiry_date = ?, status = 'active' WHERE id = ?")->execute([$new_expiry, $invData['panel_id']]);
+                    }
+                }
+                
+                $pdo->prepare("UPDATE invoices SET status = ? WHERE id = ?")->execute([$new_status, $inv_id]);
+                $pdo->commit();
+                $processed++;
+            }
+            $success = "Successfully updated $processed invoice(s). Time extensions applied to active panels.";
+        } catch (PDOException $e) {
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            $error = "Database error updating invoice statuses.";
+        }
+    } else {
+        $error = "Please select at least one invoice and a valid status.";
     }
 }
 
@@ -68,7 +231,15 @@ $admin = $adminStmt->fetch();
 
 // --- FETCH USER DETAILS & ALL ASSETS ---
 try {
-    $stmt = $pdo->prepare("SELECT * FROM users WHERE id = :id LIMIT 1");
+    // JOIN Billing profile fields
+    $stmt = $pdo->prepare("
+        SELECT u.*, 
+               b.billing_type, b.company_name, b.tax_id, b.billing_email, 
+               b.address_line1, b.address_line2, b.city, b.state_province, b.postal_code, b.country 
+        FROM users u 
+        LEFT JOIN user_billing_profiles b ON u.id = b.user_id
+        WHERE u.id = :id LIMIT 1
+    ");
     $stmt->execute(['id' => $user_id]);
     $user = $stmt->fetch();
     if (!$user) { die("Client not found."); }
@@ -78,7 +249,7 @@ try {
     $panelsStmt->execute(['id' => $user_id]);
     $userPanels = $panelsStmt->fetchAll();
 
-    // Fetch Invoices
+    // Fetch Invoices (Now includes new `type` field implicitly)
     $invStmt = $pdo->prepare("SELECT * FROM invoices WHERE user_id = :id ORDER BY created_at DESC");
     $invStmt->execute(['id' => $user_id]);
     $userInvoices = $invStmt->fetchAll();
@@ -159,13 +330,16 @@ $page_title = 'Client Hub: ' . $user['first_name'];
 
     /* Form Styles */
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
-    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px; }
+    .card-title { padding: 20px 24px; border-bottom: 1px solid var(--border); font-family: var(--font-head); font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; gap: 10px; background: rgba(0,0,0,0.1); color: var(--text); }
+    
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; padding: 32px; border-bottom: 1px solid var(--border); }
     @media(max-width: 900px) { .form-grid { grid-template-columns: 1fr; } }
     
     .form-group { margin-bottom: 20px; }
     .form-group label { display: block; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
     .form-control { width: 100%; padding: 12px 16px; background: var(--bg); border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text); font-family: var(--font-body); font-size: 14px; outline: none; transition: 0.2s; }
     .form-control:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     
     .wallet-input { position: relative; }
     .wallet-input i { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--accent-green); }
@@ -175,12 +349,21 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     .btn-submit { display: inline-flex; align-items: center; gap: 8px; padding: 14px 28px; background: var(--accent2); color: #fff; border: none; border-radius: 8px; font-family: var(--font-body); font-weight: 600; font-size: 14px; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 15px var(--accent-glow); }
     .btn-submit:hover { transform: translateY(-1px); filter: brightness(1.1); }
 
-    /* Tables within Tabs */
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th { padding: 16px 24px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border-strong); }
     td { padding: 16px 24px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: middle; transition: background 0.2s; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(139,92,246,0.02); }
+
+    input[type="checkbox"] { appearance: none; width: 18px; height: 18px; border: 2px solid var(--border-strong); border-radius: 4px; background: var(--bg); cursor: pointer; position: relative; transition: 0.2s; }
+    input[type="checkbox"]:checked { background: var(--accent2); border-color: var(--accent2); }
+    input[type="checkbox"]:checked::after { content: '\f00c'; font-family: 'Font Awesome 6 Free'; font-weight: 900; color: #fff; font-size: 10px; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+
+    .btn-bulk { background: rgba(139,92,246,0.1); color: var(--accent2); border: 1px solid rgba(139,92,246,0.3); padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; font-size: 13px; font-family: var(--font-body); }
+    .btn-bulk:hover { background: var(--accent2); color: #fff; }
+
+    .status-select { padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none; transition: 0.3s; cursor: pointer; margin-right: 8px; }
+    .status-select:focus { border-color: var(--accent); }
 
     .table-btn { padding: 6px 12px; background: var(--surface2); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; transition: 0.2s; display: inline-block; }
     .table-btn:hover { background: var(--accent2); color: #fff; border-color: var(--accent2); }
@@ -191,6 +374,10 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     .badge-pending, .badge-Unpaid { background: rgba(251,146,60,0.1); color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.2); }
     .badge-creating, .badge-restarting { background: rgba(59,130,246,0.1); color: #3b82f6; border: 1px solid rgba(59,130,246,0.2); }
     .badge-Refunded { background: rgba(167,139,250,0.1); color: var(--accent2); border: 1px solid rgba(167,139,250,0.2); }
+    
+    .badge-order { background: rgba(59,130,246,0.1); color: #3b82f6; border: 1px solid rgba(59,130,246,0.2); }
+    .badge-renew { background: rgba(167,139,250,0.1); color: var(--accent2); border: 1px solid rgba(167,139,250,0.2); }
+    .badge-topup { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
 
     /* Toasts */
     #toast-container { position: fixed; bottom: 32px; right: 32px; z-index: 9999; display: flex; flex-direction: column; gap: 12px; }
@@ -263,14 +450,18 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div class="tab-nav">
-        <button class="tab-btn active" data-target="tab-settings"><i class="fa-solid fa-user-pen"></i> Account Settings</button>
-        <button class="tab-btn" data-target="tab-panels"><i class="fa-solid fa-server"></i> Provisioned Panels <span class="tab-badge"><?= count($userPanels) ?></span></button>
-        <button class="tab-btn" data-target="tab-invoices"><i class="fa-solid fa-file-invoice-dollar"></i> Invoices <span class="tab-badge"><?= count($userInvoices) ?></span></button>
-        <button class="tab-btn" data-target="tab-tickets"><i class="fa-solid fa-headset"></i> Support Tickets <span class="tab-badge"><?= count($userTickets) ?></span></button>
+        <button class="tab-btn <?= $active_tab == 'settings' ? 'active' : '' ?>" data-target="tab-settings"><i class="fa-solid fa-user-pen"></i> Account & Billing</button>
+        <button class="tab-btn <?= $active_tab == 'panels' ? 'active' : '' ?>" data-target="tab-panels"><i class="fa-solid fa-server"></i> Provisioned Panels <span class="tab-badge"><?= count($userPanels) ?></span></button>
+        <button class="tab-btn <?= $active_tab == 'invoices' ? 'active' : '' ?>" data-target="tab-invoices"><i class="fa-solid fa-file-invoice-dollar"></i> Invoices <span class="tab-badge"><?= count($userInvoices) ?></span></button>
+        <button class="tab-btn <?= $active_tab == 'tickets' ? 'active' : '' ?>" data-target="tab-tickets"><i class="fa-solid fa-headset"></i> Support Tickets <span class="tab-badge"><?= count($userTickets) ?></span></button>
     </div>
 
-    <div id="tab-settings" class="tab-pane active">
+    <div id="tab-settings" class="tab-pane <?= $active_tab == 'settings' ? 'active' : '' ?>">
         <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+            
+            <div class="card-title">
+                <div style="color: var(--text);"><i class="fa-solid fa-user" style="color: var(--accent); margin-right: 8px;"></i> Core Account Settings</div>
+            </div>
             <div class="form-grid">
                 <div>
                     <div class="form-group">
@@ -292,7 +483,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
                         <label>Wallet Balance (Credits)</label>
                         <div class="wallet-input">
                             <i class="fa-solid fa-dollar-sign"></i>
-                            <input type="number" step="0.01" name="wallet_balance" class="form-control" value="<?= htmlspecialchars($user['wallet_balance']) ?>" required>
+                            <input type="number" step="0.01" name="wallet_balance" class="form-control" value="<?= htmlspecialchars($user['wallet_balance'] ?? 0.00) ?>" required>
                         </div>
                         <div style="font-size: 11px; color: var(--text-dim); margin-top: 6px;">Adjusting this immediately alters the user's purchasing power.</div>
                     </div>
@@ -310,38 +501,120 @@ $page_title = 'Client Hub: ' . $user['first_name'];
                 </div>
             </div>
 
-            <div style="padding: 0 32px 32px; display: flex; justify-content: flex-end;">
-                <button type="submit" name="update_user" class="btn-submit"><i class="fa-solid fa-floppy-disk"></i> Save Client Profile</button>
+            <div class="card-title" style="border-top: 1px solid var(--border);">
+                <div style="color: var(--text);"><i class="fa-solid fa-address-card" style="color: var(--accent-orange); margin-right: 8px;"></i> Billing Profile Details</div>
+            </div>
+            <div class="form-grid">
+                <div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>Account Type</label>
+                            <select name="billing_type" class="form-control" onchange="document.getElementById('compField').style.display = (this.value === 'company') ? 'block' : 'none';">
+                                <option value="individual" <?= ($user['billing_type'] ?? '') == 'individual' ? 'selected' : '' ?>>Individual</option>
+                                <option value="company" <?= ($user['billing_type'] ?? '') == 'company' ? 'selected' : '' ?>>Company</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="compField" style="display: <?= ($user['billing_type'] ?? '') == 'company' ? 'block' : 'none' ?>;">
+                            <label>Company Name</label>
+                            <input type="text" name="company_name" class="form-control" value="<?= htmlspecialchars($user['company_name'] ?? '') ?>" placeholder="Company LLC">
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label>Billing Email</label>
+                        <input type="email" name="billing_email" class="form-control" value="<?= htmlspecialchars($user['billing_email'] ?? $user['email']) ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>Tax ID / VAT Number</label>
+                        <input type="text" name="tax_id" class="form-control" value="<?= htmlspecialchars($user['tax_id'] ?? '') ?>" placeholder="Optional">
+                    </div>
+                </div>
+
+                <div>
+                    <div class="form-group">
+                        <label>Address Line 1</label>
+                        <input type="text" name="address_line1" class="form-control" value="<?= htmlspecialchars($user['address_line1'] ?? '') ?>" placeholder="123 Main St">
+                    </div>
+                    <div class="form-group">
+                        <label>Address Line 2</label>
+                        <input type="text" name="address_line2" class="form-control" value="<?= htmlspecialchars($user['address_line2'] ?? '') ?>" placeholder="Apt, Suite, etc.">
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>City</label>
+                            <input type="text" name="city" class="form-control" value="<?= htmlspecialchars($user['city'] ?? '') ?>">
+                        </div>
+                        <div class="form-group">
+                            <label>State / Province</label>
+                            <input type="text" name="state_province" class="form-control" value="<?= htmlspecialchars($user['state_province'] ?? '') ?>">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>ZIP Code</label>
+                            <input type="text" name="postal_code" class="form-control" value="<?= htmlspecialchars($user['postal_code'] ?? '') ?>">
+                        </div>
+                        <div class="form-group">
+                            <label>Country</label>
+                            <input type="text" name="country" class="form-control" value="<?= htmlspecialchars($user['country'] ?? '') ?>">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div style="padding: 32px; display: flex; justify-content: flex-end; border-top: 1px solid var(--border);">
+                <button type="submit" name="update_user" class="btn-submit"><i class="fa-solid fa-floppy-disk"></i> Save Complete Profile</button>
             </div>
         </form>
     </div>
 
-    <div id="tab-panels" class="tab-pane">
-        <div class="card">
+    <div id="tab-panels" class="tab-pane <?= $active_tab == 'panels' ? 'active' : '' ?>">
+        <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+            <div class="card-title">
+                <div style="color: var(--text);"><i class="fa-solid fa-server" style="color: var(--accent); margin-right: 8px;"></i> Client Infrastructure</div>
+                <div>
+                    <button type="submit" name="bulk_generate_invoices" class="btn-bulk" onclick="return confirm('Generate next recurring Unpaid invoices for the selected panels?');">
+                        <i class="fa-solid fa-file-invoice-dollar"></i> Generate Next Invoice
+                    </button>
+                </div>
+            </div>
             <table>
                 <thead>
                     <tr>
+                        <th width="5%"><input type="checkbox" id="selectAllPanels" title="Select All Panels"></th>
                         <th width="5%">ID</th>
-                        <th width="30%">Domain</th>
+                        <th width="20%">Domain</th>
                         <th width="15%">Nodes</th>
-                        <th width="20%">Status</th>
+                        <th width="15%">Status</th>
+                        <th width="15%">Expiry Date</th>
                         <th width="15%">Created</th>
-                        <th width="15%" style="text-align: right;">Action</th>
+                        <th width="10%" style="text-align: right;">Action</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if(empty($userPanels)): ?>
-                        <tr><td colspan="6" style="text-align: center; padding: 48px; color: var(--text-dim);">No panels found for this client.</td></tr>
+                        <tr><td colspan="8" style="text-align: center; padding: 48px; color: var(--text-dim);">No panels found for this client.</td></tr>
                     <?php else: foreach($userPanels as $p): ?>
                         <tr>
+                            <td><input type="checkbox" name="selected_panels[]" value="<?= $p['id'] ?>" class="panel-checkbox"></td>
                             <td style="font-family: var(--font-mono); color: var(--text-muted);">#<?= $p['id'] ?></td>
                             <td style="font-weight: 600; color: var(--text);"><?= htmlspecialchars($p['domain']) ?></td>
                             <td style="font-weight: 500;"><?= $p['nodes_count'] ?> Node(s)</td>
                             <td><span class="badge badge-<?= $p['status'] ?>"><?= htmlspecialchars(str_replace('_', ' ', $p['status'])) ?></span></td>
+                            <td style="font-family: var(--font-mono); font-size: 13px;">
+                                <?php 
+                                    if (!empty($p['expiry_date'])) {
+                                        $exp = strtotime($p['expiry_date']);
+                                        $color = ($exp < time()) ? 'var(--accent-red)' : 'var(--text)';
+                                        echo "<span style='color: $color;'>" . date('M j, Y', $exp) . "</span>";
+                                    } else {
+                                        echo "<span style='color: var(--text-muted);'>N/A</span>";
+                                    }
+                                ?>
+                            </td>
                             <td style="color: var(--text-dim); font-size: 13px; font-family: var(--font-mono);"><?= date('M j, Y', strtotime($p['created_at'])) ?></td>
                             <td style="text-align: right;">
                                 <?php if(in_array($p['status'], ['pending', 'payment_pending'])): ?>
-                                    <a href="orders.php?action=fulfill&id=<?= $p['id'] ?>" class="table-btn"><i class="fa-solid fa-box-open"></i> View Order</a>
+                                    <a href="orders.php?action=fulfill&id=<?= $p['id'] ?>" class="table-btn"><i class="fa-solid fa-box-open"></i> Order</a>
                                 <?php else: ?>
                                     <a href="manage_panel.php?id=<?= $p['id'] ?>" class="table-btn"><i class="fa-solid fa-server"></i> Manage</a>
                                 <?php endif; ?>
@@ -350,41 +623,71 @@ $page_title = 'Client Hub: ' . $user['first_name'];
                     <?php endforeach; endif; ?>
                 </tbody>
             </table>
-        </div>
+        </form>
     </div>
 
-    <div id="tab-invoices" class="tab-pane">
-        <div class="card">
+    <div id="tab-invoices" class="tab-pane <?= $active_tab == 'invoices' ? 'active' : '' ?>">
+        <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+            <div class="card-title">
+                <div style="color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent-green); margin-right: 8px;"></i> Billing History</div>
+                <div style="display: flex; align-items: center;">
+                    <select name="invoice_status" class="status-select" required>
+                        <option value="">-- Set Status --</option>
+                        <option value="Paid">Mark as Paid</option>
+                        <option value="Unpaid">Mark as Unpaid</option>
+                        <option value="Cancelled">Cancel Invoices</option>
+                    </select>
+                    <button type="submit" name="bulk_update_invoices" class="btn-bulk" onclick="return confirm('Update status for selected invoices? Note: Marking as Paid will automatically extend panel expiry dates.');"><i class="fa-solid fa-check"></i> Apply</button>
+                </div>
+            </div>
             <table>
                 <thead>
                     <tr>
-                        <th width="20%">Invoice Number</th>
-                        <th width="20%">Amount</th>
-                        <th width="20%">Status</th>
-                        <th width="20%">Date Issued</th>
-                        <th width="20%" style="text-align: right;">Action</th>
+                        <th width="5%"><input type="checkbox" id="selectAllInvoices" title="Select All Invoices"></th>
+                        <th width="15%">Invoice Number</th>
+                        <th width="10%">Type</th>
+                        <th width="20%">Billing Period</th>
+                        <th width="10%">Amount</th>
+                        <th width="10%">Status</th>
+                        <th width="15%">Date Issued</th>
+                        <th width="15%" style="text-align: right;">Action</th>
                     </tr>
                 </thead>
                 <tbody>
                     <?php if(empty($userInvoices)): ?>
-                        <tr><td colspan="5" style="text-align: center; padding: 48px; color: var(--text-dim);">No billing history for this client.</td></tr>
+                        <tr><td colspan="8" style="text-align: center; padding: 48px; color: var(--text-dim);">No billing history for this client.</td></tr>
                     <?php else: foreach($userInvoices as $inv): ?>
                         <tr>
+                            <td><input type="checkbox" name="selected_invoices[]" value="<?= $inv['id'] ?>" class="invoice-checkbox"></td>
                             <td style="font-family: var(--font-mono); font-weight: 600; color: var(--text);"><?= htmlspecialchars($inv['invoice_number']) ?></td>
+                            <td>
+                                <span class="badge badge-<?= htmlspecialchars($inv['type'] ?? 'order') ?>">
+                                    <?= htmlspecialchars($inv['type'] ?? 'order') ?>
+                                </span>
+                            </td>
+                            <td style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">
+                                <?php 
+                                    if ($inv['period_start'] && $inv['period_end']) {
+                                        echo date('M j, Y', strtotime($inv['period_start'])) . ' <i class="fa-solid fa-arrow-right" style="margin: 0 4px; opacity: 0.5;"></i> ' . date('M j, Y', strtotime($inv['period_end']));
+                                    } else {
+                                        echo "N/A";
+                                    }
+                                ?>
+                            </td>
                             <td style="font-family: var(--font-mono); font-weight: 600;">$<?= number_format($inv['amount'], 2) ?></td>
                             <td><span class="badge badge-<?= $inv['status'] ?>"><?= htmlspecialchars($inv['status']) ?></span></td>
                             <td style="color: var(--text-dim); font-size: 13px; font-family: var(--font-mono);"><?= date('M j, Y', strtotime($inv['created_at'])) ?></td>
                             <td style="text-align: right;">
-                                <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" class="table-btn"><i class="fa-solid fa-file-invoice"></i> View Invoice</a>
+                                <a href="../user/view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" target="_blank" class="table-btn"><i class="fa-solid fa-file-invoice"></i> View</a>
                             </td>
                         </tr>
                     <?php endforeach; endif; ?>
                 </tbody>
             </table>
-        </div>
+        </form>
     </div>
 
-    <div id="tab-tickets" class="tab-pane">
+    <div id="tab-tickets" class="tab-pane <?= $active_tab == 'tickets' ? 'active' : '' ?>">
         <div class="card">
             <table>
                 <thead>
@@ -466,6 +769,21 @@ document.addEventListener('DOMContentLoaded', () => {
             if(target) target.classList.add('active');
         });
     });
+
+    // Checkboxes Check-All Logic
+    const selectAllPanels = document.getElementById('selectAllPanels');
+    if (selectAllPanels) {
+        selectAllPanels.addEventListener('change', function() {
+            document.querySelectorAll('.panel-checkbox').forEach(cb => cb.checked = this.checked);
+        });
+    }
+
+    const selectAllInvoices = document.getElementById('selectAllInvoices');
+    if (selectAllInvoices) {
+        selectAllInvoices.addEventListener('change', function() {
+            document.querySelectorAll('.invoice-checkbox').forEach(cb => cb.checked = this.checked);
+        });
+    }
 });
 </script>
 </body>

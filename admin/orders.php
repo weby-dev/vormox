@@ -16,42 +16,33 @@ try {
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
 // ==========================================
-// HANDLE AUTO-SAVE (AJAX)
+// HANDLE AUTO-SAVE (AJAX) - UPSERT FIX
 // ==========================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['autosave'])) {
     header('Content-Type: application/json');
     $panel_id = filter_input(INPUT_POST, 'panel_id', FILTER_VALIDATE_INT);
     
-    if (!$panel_id) { echo json_encode(['success' => false]); exit; }
+    if (!$panel_id) { echo json_encode(['success' => false, 'error' => 'Missing Panel ID']); exit; }
     
     try {
-        $checkStmt = $pdo->prepare("SELECT id FROM panel_details WHERE panel_id = :pid");
-        $checkStmt->execute(['pid' => $panel_id]);
-        $exists = $checkStmt->fetch();
-
-        if ($exists) {
-            $sql = "UPDATE panel_details SET 
-                be_service = :besrv, be_server_ip = :beip, be_ssh_port = :beport, be_ssh_user = :beusr, be_ssh_pass = :bepass, be_git_url = :begit, be_git_user = :begitu, be_git_pass = :begitp,
-                fe_service = :fesrv, fe_server_ip = :feip, fe_ssh_port = :feport, fe_ssh_user = :feusr, fe_ssh_pass = :fepass, fe_git_url = :fegit, fe_git_user = :fegitu, fe_git_pass = :fegitp,
-                rp_service = :rpsrv, rp_server_ip = :rpip, rp_ssh_port = :rpport, rp_ssh_user = :rpusr, rp_ssh_pass = :rppass,
-                db_server_ip = :dbip, db_name = :dbname, db_user = :dbusr, db_pass = :dbpass
-                WHERE panel_id = :pid";
-        } else {
-            // Insert as draft (status remains 'draft' until manually accepted)
-            $sql = "INSERT INTO panel_details (
-                panel_id, 
-                be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass,
-                fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass,
-                rp_service, rp_server_ip, rp_ssh_port, rp_ssh_user, rp_ssh_pass,
-                db_server_ip, db_name, db_user, db_pass, status
-            ) VALUES (
-                :pid, 
-                :besrv, :beip, :beport, :beusr, :bepass, :begit, :begitu, :begitp,
-                :fesrv, :feip, :feport, :feusr, :fepass, :fegit, :fegitu, :fegitp,
-                :rpsrv, :rpip, :rpport, :rpusr, :rppass,
-                :dbip, :dbname, :dbusr, :dbpass, 'draft'
-            )";
-        }
+        // Robust UPSERT: Creates the row if it doesn't exist, updates it if it does
+        $sql = "INSERT INTO panel_details (
+            panel_id, 
+            be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass,
+            fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass,
+            rp_service, rp_server_ip, rp_ssh_port, rp_ssh_user, rp_ssh_pass,
+            db_server_ip, db_name, db_user, db_pass, status
+        ) VALUES (
+            :pid, 
+            :besrv, :beip, :beport, :beusr, :bepass, :begit, :begitu, :begitp,
+            :fesrv, :feip, :feport, :feusr, :fepass, :fegit, :fegitu, :fegitp,
+            :rpsrv, :rpip, :rpport, :rpusr, :rppass,
+            :dbip, :dbname, :dbusr, :dbpass, 'draft'
+        ) ON DUPLICATE KEY UPDATE 
+            be_service = VALUES(be_service), be_server_ip = VALUES(be_server_ip), be_ssh_port = VALUES(be_ssh_port), be_ssh_user = VALUES(be_ssh_user), be_ssh_pass = VALUES(be_ssh_pass), be_git_url = VALUES(be_git_url), be_git_user = VALUES(be_git_user), be_git_pass = VALUES(be_git_pass),
+            fe_service = VALUES(fe_service), fe_server_ip = VALUES(fe_server_ip), fe_ssh_port = VALUES(fe_ssh_port), fe_ssh_user = VALUES(fe_ssh_user), fe_ssh_pass = VALUES(fe_ssh_pass), fe_git_url = VALUES(fe_git_url), fe_git_user = VALUES(fe_git_user), fe_git_pass = VALUES(fe_git_pass),
+            rp_service = VALUES(rp_service), rp_server_ip = VALUES(rp_server_ip), rp_ssh_port = VALUES(rp_ssh_port), rp_ssh_user = VALUES(rp_ssh_user), rp_ssh_pass = VALUES(rp_ssh_pass),
+            db_server_ip = VALUES(db_server_ip), db_name = VALUES(db_name), db_user = VALUES(db_user), db_pass = VALUES(db_pass)";
 
         $stmt = $pdo->prepare($sql);
         $stmt->execute([

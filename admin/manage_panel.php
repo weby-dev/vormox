@@ -18,6 +18,72 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { he
 $panel_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 if (!$panel_id) { header("Location: panels.php"); exit; }
 
+$success = ''; $error = '';
+
+// --- HANDLE FULL CONFIGURATION UPDATE ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_panel_config'])) {
+    try {
+        $pdo->beginTransaction();
+
+        // 1. Update user_panels
+        $domain = filter_input(INPUT_POST, 'domain', FILTER_SANITIZE_SPECIAL_CHARS);
+        $nodes = filter_input(INPUT_POST, 'nodes_count', FILTER_VALIDATE_INT);
+        $billing = filter_input(INPUT_POST, 'billing_cycle', FILTER_SANITIZE_SPECIAL_CHARS);
+        $status = filter_input(INPUT_POST, 'status', FILTER_SANITIZE_SPECIAL_CHARS);
+        $auto_renew = isset($_POST['auto_renew']) ? 1 : 0;
+        
+        $expiry_date = !empty($_POST['expiry_date']) ? $_POST['expiry_date'] : null;
+
+        $upStmt = $pdo->prepare("UPDATE user_panels SET domain = ?, nodes_count = ?, billing_cycle = ?, status = ?, expiry_date = ?, auto_renew = ? WHERE id = ?");
+        $upStmt->execute([$domain, $nodes, $billing, $status, $expiry_date, $auto_renew, $panel_id]);
+
+        // 2. Update panel_details
+        $checkPd = $pdo->prepare("SELECT id FROM panel_details WHERE panel_id = ?");
+        $checkPd->execute([$panel_id]);
+        $pdExists = $checkPd->fetch();
+
+        if ($pdExists) {
+            $pdSql = "UPDATE panel_details SET 
+                be_service = ?, be_server_ip = ?, be_ssh_port = ?, be_ssh_user = ?, be_ssh_pass = ?, be_git_url = ?, be_git_user = ?, be_git_pass = ?,
+                fe_service = ?, fe_server_ip = ?, fe_ssh_port = ?, fe_ssh_user = ?, fe_ssh_pass = ?, fe_git_url = ?, fe_git_user = ?, fe_git_pass = ?,
+                db_server_ip = ?, db_name = ?, db_user = ?, db_pass = ?,
+                rp_service = ?, rp_server_ip = ?, rp_ssh_port = ?, rp_ssh_user = ?, rp_ssh_pass = ?
+                WHERE panel_id = ?";
+            
+            $pdo->prepare($pdSql)->execute([
+                $_POST['be_service'], $_POST['be_server_ip'], $_POST['be_ssh_port'] ?: 22, $_POST['be_ssh_user'], $_POST['be_ssh_pass'], $_POST['be_git_url'], $_POST['be_git_user'], $_POST['be_git_pass'],
+                $_POST['fe_service'], $_POST['fe_server_ip'], $_POST['fe_ssh_port'] ?: 22, $_POST['fe_ssh_user'], $_POST['fe_ssh_pass'], $_POST['fe_git_url'], $_POST['fe_git_user'], $_POST['fe_git_pass'],
+                $_POST['db_server_ip'], $_POST['db_name'], $_POST['db_user'], $_POST['db_pass'],
+                $_POST['rp_service'], $_POST['rp_server_ip'], $_POST['rp_ssh_port'] ?: 22, $_POST['rp_ssh_user'], $_POST['rp_ssh_pass'],
+                $panel_id
+            ]);
+        } else {
+            $pdSql = "INSERT INTO panel_details (
+                panel_id, status,
+                be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass,
+                fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass,
+                db_server_ip, db_name, db_user, db_pass,
+                rp_service, rp_server_ip, rp_ssh_port, rp_ssh_user, rp_ssh_pass
+            ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+            $pdo->prepare($pdSql)->execute([
+                $panel_id,
+                $_POST['be_service'], $_POST['be_server_ip'], $_POST['be_ssh_port'] ?: 22, $_POST['be_ssh_user'], $_POST['be_ssh_pass'], $_POST['be_git_url'], $_POST['be_git_user'], $_POST['be_git_pass'],
+                $_POST['fe_service'], $_POST['fe_server_ip'], $_POST['fe_ssh_port'] ?: 22, $_POST['fe_ssh_user'], $_POST['fe_ssh_pass'], $_POST['fe_git_url'], $_POST['fe_git_user'], $_POST['fe_git_pass'],
+                $_POST['db_server_ip'], $_POST['db_name'], $_POST['db_user'], $_POST['db_pass'],
+                $_POST['rp_service'], $_POST['rp_server_ip'], $_POST['rp_ssh_port'] ?: 22, $_POST['rp_ssh_user'], $_POST['rp_ssh_pass']
+            ]);
+        }
+
+        $pdo->commit();
+        $success = "Configuration updated successfully.";
+    } catch (PDOException $e) {
+        $pdo->rollBack();
+        $error = "Database error while updating configuration.";
+    }
+}
+
+// --- FETCH DATA FOR NOTIFICATIONS ---
 $current_page = basename($_SERVER['PHP_SELF']);
 try {
     $pendingOrdersCount = $pdo->query("SELECT COUNT(*) FROM user_panels WHERE status IN ('pending', 'payment_pending')")->fetchColumn();
@@ -28,8 +94,10 @@ try {
     $stmt = $pdo->prepare("
         SELECT p.*, u.first_name, u.last_name, u.email, 
                pd.be_service, pd.fe_service, pd.be_status, pd.fe_status,
-               pd.be_server_ip, pd.be_ssh_port, pd.be_ssh_user, pd.be_ssh_pass,
-               pd.be_git_url, pd.fe_server_ip, pd.db_name, pd.db_user, pd.status as details_status 
+               pd.be_server_ip, pd.be_ssh_port, pd.be_ssh_user, pd.be_ssh_pass, pd.be_git_url, pd.be_git_user, pd.be_git_pass,
+               pd.fe_server_ip, pd.fe_ssh_port, pd.fe_ssh_user, pd.fe_ssh_pass, pd.fe_git_url, pd.fe_git_user, pd.fe_git_pass,
+               pd.rp_server_ip, pd.rp_service, pd.rp_ssh_port, pd.rp_ssh_user, pd.rp_ssh_pass,
+               pd.db_server_ip, pd.db_name, pd.db_user, pd.db_pass, pd.status as details_status 
         FROM user_panels p 
         JOIN users u ON p.user_id = u.id 
         LEFT JOIN panel_details pd ON p.id = pd.panel_id 
@@ -99,7 +167,7 @@ $page_title = 'Manage: ' . $panel['domain'];
     .service-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; margin-bottom: 48px; }
 
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 32px; transition: background 0.3s, border-color 0.3s; display: flex; flex-direction: column; }
-    .card-title { font-family: var(--font-head); font-size: 18px; font-weight: 700; margin-bottom: 24px; color: var(--text); display: flex; align-items: center; gap: 10px; }
+    .card-title { font-family: var(--font-head); font-size: 18px; font-weight: 700; margin-bottom: 24px; color: var(--text); display: flex; align-items: center; justify-content: space-between; }
     
     .data-row { display: flex; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--border); font-size: 14px; align-items: center; }
     .data-row:last-child { border-bottom: none; }
@@ -126,12 +194,15 @@ $page_title = 'Manage: ' . $panel['domain'];
     .btn-remove { background: transparent; color: var(--accent-red); border: 1px dashed var(--accent-red); margin-top: 8px; }
     .btn-remove:hover:not(:disabled) { background: rgba(248,113,113,0.1); }
 
+    .btn-edit-config { background: var(--surface2); color: var(--text); border: 1px solid var(--border-strong); padding: 6px 12px; border-radius: 6px; font-size: 12px; font-family: var(--font-body); font-weight: 600; cursor: pointer; transition: 0.2s; }
+    .btn-edit-config:hover { background: var(--accent2); color: #fff; border-color: var(--accent2); }
+
     .badge { padding: 4px 10px; border-radius: 100px; font-size: 11px; font-weight: 700; text-transform: uppercase; font-family: var(--font-mono); display: inline-block; letter-spacing: 0.05em; }
     .badge-active { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
     .badge-offline { background: rgba(248,113,113,0.1); color: var(--accent-red); border: 1px solid rgba(248,113,113,0.2); }
     .badge-other { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
 
-    .terminal-wrapper { background: #000; border: 1px solid #333; border-radius: 12px; overflow: hidden; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+    .terminal-wrapper { background: #000; border: 1px solid #333; border-radius: 12px; overflow: hidden; box-shadow: 0 20px 40px rgba(0,0,0,0.5); margin-top: 32px; }
     .terminal-header { background: #1a1a1a; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; }
     .terminal-dots { display: flex; gap: 8px; }
     .dot { width: 12px; height: 12px; border-radius: 50%; }
@@ -144,7 +215,32 @@ $page_title = 'Manage: ' . $panel['domain'];
     .pulse { animation: pulse 1.5s infinite; }
     @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
-    #toast-container { position: fixed; bottom: 32px; right: 32px; z-index: 9999; display: flex; flex-direction: column; gap: 12px; }
+    /* Edit Modal Styles */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); z-index: 9999; display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.3s; overflow-y: auto; padding: 40px 20px; }
+    .modal-overlay.show { display: flex; opacity: 1; }
+    .modal-content { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 16px; width: 100%; max-width: 1000px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); transform: translateY(20px); transition: transform 0.3s; position: relative; margin: auto; }
+    .modal-overlay.show .modal-content { transform: translateY(0); }
+    .modal-header { padding: 24px 32px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; font-family: var(--font-head); font-size: 20px; font-weight: 700; background: rgba(0,0,0,0.2); border-radius: 16px 16px 0 0; }
+    .close-btn { background: transparent; border: none; color: var(--text-muted); cursor: pointer; font-size: 20px; transition: 0.2s; }
+    .close-btn:hover { color: var(--accent-red); }
+    .modal-body { padding: 32px; }
+
+    .form-grid-modal { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+    @media(max-width: 900px) { .form-grid-modal { grid-template-columns: 1fr; } }
+    
+    .form-section { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 24px; }
+    .form-section h3 { font-family: var(--font-head); font-size: 15px; margin-bottom: 16px; color: var(--text); display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+    
+    .input-group { margin-bottom: 16px; }
+    .input-group label { display: block; font-size: 11px; font-weight: 600; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; margin-bottom: 6px; }
+    .input-group input, .input-group select { width: 100%; padding: 10px 14px; background: var(--bg); border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); font-family: var(--font-body); font-size: 13px; outline: none; transition: 0.2s; }
+    .input-group input:focus, .input-group select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+    .input-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    .btn-save { background: var(--accent2); color: #fff; padding: 14px 32px; border: none; border-radius: 8px; font-family: var(--font-body); font-weight: 600; cursor: pointer; transition: 0.2s; font-size: 15px; display: block; width: 100%; box-shadow: 0 4px 15px var(--accent-glow); }
+    .btn-save:hover { filter: brightness(1.1); transform: translateY(-1px); }
+
+    #toast-container { position: fixed; bottom: 32px; right: 32px; z-index: 99999; display: flex; flex-direction: column; gap: 12px; }
     .toast { padding: 16px 24px; border-radius: 8px; font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 12px; color: var(--text); box-shadow: 0 10px 30px rgba(0,0,0,0.3); animation: slideIn 0.3s ease forwards; min-width: 300px; font-family: var(--font-body); background: var(--surface); }
     .toast.success { border: 1px solid rgba(34,211,238,0.3); border-left: 4px solid var(--accent-green); }
     .toast.error { border: 1px solid rgba(248,113,113,0.3); border-left: 4px solid var(--accent-red); }
@@ -200,15 +296,20 @@ $page_title = 'Manage: ' . $panel['domain'];
 
     <div class="top-grid">
         <div class="card">
-            <div class="card-title"><i class="fa-solid fa-globe" style="color: var(--accent2);"></i> Panel Information</div>
+            <div class="card-title">
+                <div><i class="fa-solid fa-globe" style="color: var(--accent2);"></i> Panel Information</div>
+                <button class="btn-edit-config" onclick="openConfigModal()"><i class="fa-solid fa-pen-to-square"></i> Edit Config</button>
+            </div>
             <div class="data-row"><span class="data-label">Domain</span><span class="data-value"><?= htmlspecialchars($panel['domain']) ?></span></div>
             <div class="data-row"><span class="data-label">Client Name</span><span class="data-value"><?= htmlspecialchars($panel['first_name'] . ' ' . $panel['last_name']) ?></span></div>
+            <div class="data-row"><span class="data-label">Expiry Date</span><span class="data-value data-mono"><?= $panel['expiry_date'] ? date('M j, Y', strtotime($panel['expiry_date'])) : 'N/A' ?></span></div>
             <div class="data-row"><span class="data-label">Status</span><span class="badge <?= $panel['status'] == 'active' ? 'badge-active' : 'badge-other' ?>"><?= htmlspecialchars(str_replace('_', ' ', $panel['status'])) ?></span></div>
         </div>
 
         <div class="card">
             <div class="card-title"><i class="fa-solid fa-database" style="color: var(--accent-orange);"></i> Database Details</div>
             <?php if($panel['db_name']): ?>
+                <div class="data-row"><span class="data-label">DB Host</span><span class="data-value data-mono"><?= htmlspecialchars($panel['db_server_ip']) ?></span></div>
                 <div class="data-row"><span class="data-label">DB Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['db_name']) ?></span></div>
                 <div class="data-row"><span class="data-label">DB User</span><span class="data-value data-mono"><?= htmlspecialchars($panel['db_user']) ?></span></div>
             <?php else: ?>
@@ -232,6 +333,7 @@ $page_title = 'Manage: ' . $panel['domain'];
                     </span>
                 </div>
                 <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['be_service']) ?></span></div>
+                <div class="data-row"><span class="data-label">Server IP</span><span class="data-value data-mono"><?= htmlspecialchars($panel['be_server_ip']) ?></span></div>
                 
                 <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Daemon Controls</div>
@@ -270,6 +372,7 @@ $page_title = 'Manage: ' . $panel['domain'];
                     </span>
                 </div>
                 <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['fe_service']) ?></span></div>
+                <div class="data-row"><span class="data-label">Server IP</span><span class="data-value data-mono"><?= htmlspecialchars($panel['fe_server_ip']) ?></span></div>
                 
                 <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Daemon Controls</div>
@@ -285,6 +388,24 @@ $page_title = 'Manage: ' . $panel['domain'];
         </div>
     </div>
 
+    <div class="card" style="border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.02); margin-top: 32px;">
+        <div class="card-title" style="color: var(--accent-red);">
+            <div><i class="fa-solid fa-triangle-exclamation" style="margin-right: 8px;"></i> Danger Zone: Terminate Service</div>
+        </div>
+        <div style="font-size: 14px; color: var(--text-dim); margin-bottom: 24px; line-height: 1.6;">
+            Terminating this service is an irreversible action. It will instantly execute the following procedures:
+            <ul style="margin-top: 8px; padding-left: 24px; color: var(--text-muted);">
+                <li>Cancel all pending and unpaid invoices for this service.</li>
+                <li>Connect to the client's database to extract all Reseller configurations.</li>
+                <li>Access the Reverse Proxy edge nodes to wipe routing for the primary domain and all reseller domains.</li>
+                <li>Issue shutdown commands to the backend and frontend nodes.</li>
+            </ul>
+        </div>
+        <div>
+            <button class="control-btn btn-stop" onclick="confirmTermination()" style="width: auto; padding: 12px 32px;"><i class="fa-solid fa-skull"></i> Execute Service Teardown</button>
+        </div>
+    </div>
+
     <div class="terminal-wrapper">
         <div class="terminal-header">
             <div class="terminal-dots">
@@ -292,16 +413,26 @@ $page_title = 'Manage: ' . $panel['domain'];
             </div>
             <div style="display: flex; gap: 12px; align-items: center;">
                 <span class="pulse" id="liveIndicator" style="color: #0f0; font-family: var(--font-mono); font-size: 11px; display: none;">● LIVE</span>
+                
                 <select class="terminal-select" id="logSource">
                     <option value="">-- Select Service to Monitor --</option>
-                    <?php if($panel['be_service']): ?>
+                    
+                    <?php if(!empty($panel['be_server_ip'])): ?>
                         <option value="be">Backend Daemon Logs (journalctl)</option>
                         <option value="be_task">Backend Build & Task Progress</option>
                     <?php endif; ?>
-                    <?php if($panel['fe_service']): ?>
-                        <option value="fe">Frontend Daemon Logs</option>
+                    
+                    <?php if(!empty($panel['fe_server_ip'])): ?>
+                        <option value="fe">Frontend Daemon Logs (journalctl)</option>
+                    <?php endif; ?>
+                    
+                    <?php if(!empty($panel['rp_server_ip'])): ?>
+                        <option value="" disabled>──────────────────────</option>
+                        <option value="rp_access">Reverse Proxy: Access Logs</option>
+                        <option value="rp_error">Reverse Proxy: Error Logs</option>
                     <?php endif; ?>
                 </select>
+                
             </div>
         </div>
         <div class="terminal-body" id="terminalBody">
@@ -312,8 +443,142 @@ $page_title = 'Manage: ' . $panel['domain'];
   </div>
 </main>
 
+<div class="modal-overlay" id="configModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            Edit Full Panel Configuration
+            <button class="close-btn" onclick="closeConfigModal()"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div class="modal-body">
+            <form method="POST" action="manage_panel.php?id=<?= $panel_id ?>">
+                
+                <div class="form-grid-modal">
+                    
+                    <div class="form-section">
+                        <h3><i class="fa-solid fa-globe" style="color: var(--accent);"></i> General Configuration</h3>
+                        <div class="input-group"><label>Domain</label><input type="text" name="domain" value="<?= htmlspecialchars($panel['domain']) ?>" required></div>
+                        <div class="input-row">
+                            <div class="input-group"><label>Nodes Count</label><input type="number" name="nodes_count" value="<?= htmlspecialchars($panel['nodes_count']) ?>" required></div>
+                            <div class="input-group">
+                                <label>Billing Cycle</label>
+                                <select name="billing_cycle">
+                                    <option value="monthly" <?= $panel['billing_cycle'] == 'monthly' ? 'selected' : '' ?>>Monthly</option>
+                                    <option value="quarterly" <?= $panel['billing_cycle'] == 'quarterly' ? 'selected' : '' ?>>Quarterly</option>
+                                    <option value="semi_annually" <?= $panel['billing_cycle'] == 'semi_annually' ? 'selected' : '' ?>>Semi-Annually</option>
+                                    <option value="annually" <?= $panel['billing_cycle'] == 'annually' ? 'selected' : '' ?>>Annually</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group">
+                                <label>Panel Status</label>
+                                <select name="status">
+                                    <option value="payment_pending" <?= $panel['status'] == 'payment_pending' ? 'selected' : '' ?>>Payment Pending</option>
+                                    <option value="pending" <?= $panel['status'] == 'pending' ? 'selected' : '' ?>>Pending Build</option>
+                                    <option value="creating" <?= $panel['status'] == 'creating' ? 'selected' : '' ?>>Creating</option>
+                                    <option value="active" <?= $panel['status'] == 'active' ? 'selected' : '' ?>>Active</option>
+                                    <option value="restarting" <?= $panel['status'] == 'restarting' ? 'selected' : '' ?>>Restarting</option>
+                                    <option value="suspended" <?= $panel['status'] == 'suspended' ? 'selected' : '' ?>>Suspended</option>
+                                    <option value="error" <?= $panel['status'] == 'error' ? 'selected' : '' ?>>Error</option>
+                                </select>
+                            </div>
+                            <div class="input-group"><label>Expiry Date</label><input type="datetime-local" name="expiry_date" value="<?= $panel['expiry_date'] ? date('Y-m-d\TH:i', strtotime($panel['expiry_date'])) : '' ?>"></div>
+                        </div>
+                        <div class="input-group" style="display: flex; align-items: center; gap: 8px;">
+                            <input type="checkbox" name="auto_renew" value="1" <?= $panel['auto_renew'] ? 'checked' : '' ?> style="width: auto;"> <span style="font-size: 13px; font-weight: 500;">Enable Auto-Renew</span>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3><i class="fa-solid fa-database" style="color: var(--accent-orange);"></i> Database Mapping</h3>
+                        <div class="input-group"><label>DB Server IP</label><input type="text" name="db_server_ip" value="<?= htmlspecialchars($panel['db_server_ip'] ?? '') ?>"></div>
+                        <div class="input-group"><label>DB Name</label><input type="text" name="db_name" value="<?= htmlspecialchars($panel['db_name'] ?? '') ?>"></div>
+                        <div class="input-row">
+                            <div class="input-group"><label>DB User</label><input type="text" name="db_user" value="<?= htmlspecialchars($panel['db_user'] ?? '') ?>"></div>
+                            <div class="input-group"><label>DB Password</label><input type="text" name="db_pass" value="<?= htmlspecialchars($panel['db_pass'] ?? '') ?>"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3><i class="fa-solid fa-server" style="color: var(--accent-green);"></i> Backend Node</h3>
+                        <div class="input-row">
+                            <div class="input-group"><label>Server IP</label><input type="text" name="be_server_ip" value="<?= htmlspecialchars($panel['be_server_ip'] ?? '') ?>"></div>
+                            <div class="input-group"><label>Service Name</label><input type="text" name="be_service" value="<?= htmlspecialchars($panel['be_service'] ?? '') ?>"></div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group"><label>SSH Port</label><input type="number" name="be_ssh_port" value="<?= htmlspecialchars($panel['be_ssh_port'] ?? '22') ?>"></div>
+                            <div class="input-group"><label>SSH User</label><input type="text" name="be_ssh_user" value="<?= htmlspecialchars($panel['be_ssh_user'] ?? 'root') ?>"></div>
+                        </div>
+                        <div class="input-group"><label>SSH Password</label><input type="text" name="be_ssh_pass" value="<?= htmlspecialchars($panel['be_ssh_pass'] ?? '') ?>"></div>
+                        <div class="input-group"><label>Git URL</label><input type="text" name="be_git_url" value="<?= htmlspecialchars($panel['be_git_url'] ?? '') ?>"></div>
+                        <div class="input-row">
+                            <div class="input-group"><label>Git User</label><input type="text" name="be_git_user" value="<?= htmlspecialchars($panel['be_git_user'] ?? '') ?>"></div>
+                            <div class="input-group"><label>Git Token</label><input type="text" name="be_git_pass" value="<?= htmlspecialchars($panel['be_git_pass'] ?? '') ?>"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3><i class="fa-solid fa-window-maximize" style="color: #3b82f6;"></i> Frontend Node</h3>
+                        <div class="input-row">
+                            <div class="input-group"><label>Server IP</label><input type="text" name="fe_server_ip" value="<?= htmlspecialchars($panel['fe_server_ip'] ?? '') ?>"></div>
+                            <div class="input-group"><label>Service Name</label><input type="text" name="fe_service" value="<?= htmlspecialchars($panel['fe_service'] ?? '') ?>"></div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group"><label>SSH Port</label><input type="number" name="fe_ssh_port" value="<?= htmlspecialchars($panel['fe_ssh_port'] ?? '22') ?>"></div>
+                            <div class="input-group"><label>SSH User</label><input type="text" name="fe_ssh_user" value="<?= htmlspecialchars($panel['fe_ssh_user'] ?? 'root') ?>"></div>
+                        </div>
+                        <div class="input-group"><label>SSH Password</label><input type="text" name="fe_ssh_pass" value="<?= htmlspecialchars($panel['fe_ssh_pass'] ?? '') ?>"></div>
+                        <div class="input-group"><label>Git URL</label><input type="text" name="fe_git_url" value="<?= htmlspecialchars($panel['fe_git_url'] ?? '') ?>"></div>
+                        <div class="input-row">
+                            <div class="input-group"><label>Git User</label><input type="text" name="fe_git_user" value="<?= htmlspecialchars($panel['fe_git_user'] ?? '') ?>"></div>
+                            <div class="input-group"><label>Git Token</label><input type="text" name="fe_git_pass" value="<?= htmlspecialchars($panel['fe_git_pass'] ?? '') ?>"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section" style="grid-column: 1 / -1;">
+                        <h3><i class="fa-solid fa-network-wired" style="color: var(--accent2);"></i> Reverse Proxy (Optional)</h3>
+                        <div class="input-row">
+                            <div class="input-group"><label>Server IP</label><input type="text" name="rp_server_ip" value="<?= htmlspecialchars($panel['rp_server_ip'] ?? '') ?>"></div>
+                            <div class="input-group"><label>Service Name</label><input type="text" name="rp_service" value="<?= htmlspecialchars($panel['rp_service'] ?? 'nginx') ?>"></div>
+                        </div>
+                        <div class="input-row">
+                            <div class="input-group"><label>SSH Port</label><input type="number" name="rp_ssh_port" value="<?= htmlspecialchars($panel['rp_ssh_port'] ?? '22') ?>"></div>
+                            <div class="input-group"><label>SSH User</label><input type="text" name="rp_ssh_user" value="<?= htmlspecialchars($panel['rp_ssh_user'] ?? 'root') ?>"></div>
+                        </div>
+                        <div class="input-group"><label>SSH Password</label><input type="text" name="rp_ssh_pass" value="<?= htmlspecialchars($panel['rp_ssh_pass'] ?? '') ?>"></div>
+                    </div>
+
+                </div>
+
+                <div style="text-align: right; margin-top: 16px;">
+                    <button type="submit" name="update_panel_config" class="btn-save"><i class="fa-solid fa-floppy-disk"></i> Save Configuration</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <script>
 const panelId = <?= json_encode($panel_id) ?>;
+
+// --- MODAL LOGIC ---
+function openConfigModal() {
+    document.getElementById('configModal').classList.add('show');
+    document.body.style.overflow = 'hidden';
+}
+function closeConfigModal() {
+    document.getElementById('configModal').classList.remove('show');
+    document.body.style.overflow = 'auto';
+}
+
+// Close modal when clicking outside
+document.getElementById('configModal').addEventListener('click', function(e) {
+    if (e.target === this) closeConfigModal();
+});
+
+// --- TOAST LOGIC ---
+<?php if ($success): ?> showToast('success', <?= json_encode($success) ?>); <?php endif; ?>
+<?php if ($error): ?> showToast('error', <?= json_encode($error) ?>); <?php endif; ?>
 
 function showToast(type, message) {
     const container = document.getElementById('toast-container');
@@ -326,12 +591,51 @@ function showToast(type, message) {
     setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, 5000);
 }
 
+// --- TERMINATE LOGIC (Danger Zone) ---
+function confirmTermination() {
+    const confirmation = prompt("DANGER: This will tear down routing and cancel billing. Type 'TERMINATE' to proceed:");
+    if (confirmation !== "TERMINATE") {
+        showToast('error', "Termination aborted.");
+        return;
+    }
+
+    const btn = document.querySelector('.btn-stop .fa-skull').parentElement;
+    const originalHtml = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Executing Teardown Protocol...';
+    btn.disabled = true;
+
+    const formData = new FormData();
+    formData.append('ajax_action', 'terminate');
+    formData.append('service_type', 'all');
+
+    fetch(`ajax_service_handler.php?id=${panelId}`, { method: 'POST', body: formData })
+        .then(async res => {
+            if (!res.ok) throw new Error("HTTP error " + res.status);
+            return await res.json();
+        })
+        .then(data => {
+            showToast(data.status || 'error', data.message || 'Unknown response');
+            if (data.status === 'success') {
+                setTimeout(() => window.location.href = 'panels.php', 3000);
+            } else {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+            }
+        })
+        .catch(err => {
+            showToast('error', 'Execution failed. Check server connection.');
+            btn.innerHTML = originalHtml;
+            btn.disabled = false;
+        });
+}
+
+// --- ACTION LOGIC ---
 function runAction(action, type, btn) {
     let confirmMsg = `Are you sure you want to ${action.toUpperCase()} this service?`;
     if (action === 'create') {
-        confirmMsg = "WARNING: This will wipe existing backend files, clone the repository, install Maven/Java, and rebuild from scratch. It takes 3-5 minutes. Proceed?";
+        confirmMsg = "WARNING: This will wipe existing backend files, clone the repository, install dependencies, and rebuild from scratch. Proceed?";
     } else if (action === 'update') {
-        confirmMsg = "This will stop the service, pull latest git changes, and run a fresh Maven build. Proceed?";
+        confirmMsg = "This will stop the service, pull latest git changes, and run a fresh build. Proceed?";
     } else if (action === 'remove') {
         confirmMsg = "DANGER: This will STOP the service, delete the systemd file, and completely ERASE the application folder. Proceed?";
     }
@@ -346,23 +650,16 @@ function runAction(action, type, btn) {
     formData.append('ajax_action', action);
     formData.append('service_type', type);
 
-    // Call the dedicated AJAX handler with robust JSON parsing
     fetch(`ajax_service_handler.php?id=${panelId}`, { method: 'POST', body: formData })
         .then(async res => {
             if (!res.ok) throw new Error("HTTP error " + res.status);
             const text = await res.text();
-            try {
-                return JSON.parse(text);
-            } catch(e) {
-                console.error("Raw server response:", text);
-                throw new Error("Server returned invalid JSON. Check console.");
-            }
+            try { return JSON.parse(text); } catch(e) { throw new Error("Server returned invalid JSON."); }
         })
         .then(data => {
             showToast(data.status || 'error', data.message || 'Unknown response');
             
             if (data.status === 'success') {
-                // Update Badge Visually instantly
                 if (data.new_state) {
                     const badge = document.getElementById(type + '-status-badge');
                     if (badge) {
@@ -370,27 +667,20 @@ function runAction(action, type, btn) {
                         badge.className = data.new_state === 'online' ? 'badge badge-active' : 'badge badge-offline';
                     }
                 }
-
-                // Automatically switch terminal to view background tasks
                 if (['create', 'update', 'remove'].includes(action)) {
                     const logSelect = document.getElementById('logSource');
                     logSelect.value = type + '_task';
                     logSelect.dispatchEvent(new Event('change'));
                 }
-
-                // If starting or stopping, reload after a short delay to refresh button disabled states
                 if (['start', 'stop'].includes(action)) {
                     setTimeout(() => location.reload(), 1500);
                     return; 
                 }
             }
-            
-            // Always restore button state for background tasks or errors
             btn.innerHTML = originalHtml;
             btn.disabled = false;
         })
         .catch(err => {
-            console.error(err);
             showToast('error', 'Execution failed. Check browser console.');
             btn.innerHTML = originalHtml;
             btn.disabled = false;
@@ -418,7 +708,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const type = logSource.value;
         if (!type) return;
 
-        // Fetch logs via the dedicated handler
         fetch(`ajax_service_handler.php?id=${panelId}&ajax=logs&type=${type}`)
             .then(res => res.json())
             .then(data => {

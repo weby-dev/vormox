@@ -251,7 +251,7 @@ $page_title = 'Provisioned Infrastructure';
                     <th width="10%">Spec</th>
                     <th width="15%">Panel State</th>
                     <th width="15%">Override State</th>
-                    <th width="10%">Created</th>
+                    <th width="10%">Expiry Date</th>
                 </tr>
             </thead>
             <tbody>
@@ -291,8 +291,22 @@ $page_title = 'Provisioned Infrastructure';
                                 <input type="hidden" name="update_status" value="1">
                             </form>
                         </td>
-                        <td style="color: var(--text-dim); font-size: 13px;">
-                            <?= date('M j, Y', strtotime($p['created_at'])) ?>
+                        <td style="color: var(--text-dim); font-size: 13px; font-family: var(--font-mono);">
+                            <?php 
+                                if (!empty($p['expiry_date'])) {
+                                    $expiry = strtotime($p['expiry_date']);
+                                    // Highlight if it's expired or expiring soon (within 3 days)
+                                    if ($expiry < time()) {
+                                        echo '<span style="color: var(--accent-red); font-weight: 600;">' . date('M j, Y', $expiry) . '</span>';
+                                    } elseif ($expiry < strtotime('+3 days')) {
+                                        echo '<span style="color: var(--accent-orange); font-weight: 600;">' . date('M j, Y', $expiry) . '</span>';
+                                    } else {
+                                        echo date('M j, Y', $expiry);
+                                    }
+                                } else {
+                                    echo '<span style="opacity: 0.5;">N/A</span>';
+                                }
+                            ?>
                         </td>
                     </tr>
                 <?php endforeach; endif; ?>

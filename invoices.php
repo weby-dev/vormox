@@ -1,88 +1,92 @@
 <?php
 session_start();
-require_once 'auth_guard.php';
+
 if (!isset($_SESSION['user_id']) || $_SESSION['logged_in'] !== true) {
     header("Location: signin.php");
     exit;
 }
 
 require_once 'config.php';
+require_once 'auth_guard.php';
 
-$error = '';
+$user_id = $_SESSION['user_id'];
 $success = '';
+$error = '';
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['pay_invoice'])) {
-    $invoice_id = filter_input(INPUT_POST, 'invoice_id', FILTER_VALIDATE_INT);
+// --- Handle Billing Settings Update (Using UPSERT) ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_billing'])) {
     
-    if ($invoice_id) {
-        try {
-            $pdo->beginTransaction();
-            
-            $invStmt = $pdo->prepare("SELECT id, amount, status FROM invoices WHERE id = :inv_id AND user_id = :uid FOR UPDATE");
-            $invStmt->execute(['inv_id' => $invoice_id, 'uid' => $_SESSION['user_id']]);
-            $invoice = $invStmt->fetch();
-            
-            if (!$invoice) {
-                throw new Exception("Invoice not found.");
-            }
-            if ($invoice['status'] !== 'Unpaid') {
-                throw new Exception("This invoice is already paid or cancelled.");
-            }
-            
-            $userStmt = $pdo->prepare("SELECT wallet_balance FROM users WHERE id = :uid FOR UPDATE");
-            $userStmt->execute(['uid' => $_SESSION['user_id']]);
-            $userData = $userStmt->fetch();
-            
-            if ($userData['wallet_balance'] < $invoice['amount']) {
-                throw new Exception("Insufficient wallet balance. Please add funds to your account.");
-            }
-            
-            $new_balance = $userData['wallet_balance'] - $invoice['amount'];
-            $updUser = $pdo->prepare("UPDATE users SET wallet_balance = :bal WHERE id = :uid");
-            $updUser->execute(['bal' => $new_balance, 'uid' => $_SESSION['user_id']]);
-            
-            $updInv = $pdo->prepare("UPDATE invoices SET status = 'Paid', updated_at = NOW() WHERE id = :inv_id");
-            $updInv->execute(['inv_id' => $invoice['id']]);
-            
-            $pdo->commit();
-            $success = "Invoice paid successfully.";
-        } catch (Exception $e) {
-            $pdo->rollBack();
-            $error = $e->getMessage();
-        }
+    $billing_type = filter_input(INPUT_POST, 'billing_type', FILTER_SANITIZE_SPECIAL_CHARS) ?: 'individual';
+    $company_name = filter_input(INPUT_POST, 'company_name', FILTER_SANITIZE_SPECIAL_CHARS);
+    $tax_id = filter_input(INPUT_POST, 'tax_id', FILTER_SANITIZE_SPECIAL_CHARS);
+    $billing_email = filter_input(INPUT_POST, 'billing_email', FILTER_SANITIZE_EMAIL);
+    $address_line1 = filter_input(INPUT_POST, 'address_line1', FILTER_SANITIZE_SPECIAL_CHARS);
+    $address_line2 = filter_input(INPUT_POST, 'address_line2', FILTER_SANITIZE_SPECIAL_CHARS);
+    $city = filter_input(INPUT_POST, 'city', FILTER_SANITIZE_SPECIAL_CHARS);
+    $state_province = filter_input(INPUT_POST, 'state_province', FILTER_SANITIZE_SPECIAL_CHARS);
+    $postal_code = filter_input(INPUT_POST, 'postal_code', FILTER_SANITIZE_SPECIAL_CHARS);
+    $country = filter_input(INPUT_POST, 'country', FILTER_SANITIZE_SPECIAL_CHARS);
+
+    try {
+        // Insert new profile, or Update existing profile if user_id already exists
+        $updStmt = $pdo->prepare("
+            INSERT INTO user_billing_profiles 
+            (user_id, billing_type, company_name, tax_id, billing_email, address_line1, address_line2, city, state_province, postal_code, country) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE 
+            billing_type = VALUES(billing_type),
+            company_name = VALUES(company_name),
+            tax_id = VALUES(tax_id),
+            billing_email = VALUES(billing_email),
+            address_line1 = VALUES(address_line1),
+            address_line2 = VALUES(address_line2),
+            city = VALUES(city),
+            state_province = VALUES(state_province),
+            postal_code = VALUES(postal_code),
+            country = VALUES(country)
+        ");
+        
+        $updStmt->execute([
+            $user_id, $billing_type, $company_name, $tax_id, $billing_email, 
+            $address_line1, $address_line2, $city, $state_province, $postal_code, $country
+        ]);
+        
+        $success = "Billing profile updated successfully.";
+    } catch (PDOException $e) {
+        $error = "Failed to update billing profile.";
     }
 }
 
 try {
-    $userStmt = $pdo->prepare("SELECT first_name, last_name, email, theme, wallet_balance FROM users WHERE id = :id LIMIT 1");
-    $userStmt->execute(['id' => $_SESSION['user_id']]);
+    // Fetch User Profile, Wallet, and their joined Billing Profile
+    $userStmt = $pdo->prepare("
+        SELECT u.first_name, u.last_name, u.email, u.theme, u.wallet_balance,
+               b.billing_type, b.company_name, b.tax_id, b.billing_email, 
+               b.address_line1, b.address_line2, b.city, b.state_province, b.postal_code, b.country 
+        FROM users u 
+        LEFT JOIN user_billing_profiles b ON u.id = b.user_id 
+        WHERE u.id = :id LIMIT 1
+    ");
+    $userStmt->execute(['id' => $user_id]);
     $user = $userStmt->fetch();
 
-    if (!$user) {
-        session_destroy();
-        header("Location: signin.php");
-        exit;
-    }
+    // Fetch Invoices
+    $invStmt = $pdo->prepare("
+        SELECT i.*, p.domain 
+        FROM invoices i 
+        LEFT JOIN user_panels p ON i.panel_id = p.id 
+        WHERE i.user_id = :id 
+        ORDER BY i.created_at DESC
+    ");
+    $invStmt->execute(['id' => $user_id]);
+    $invoices = $invStmt->fetchAll();
+
 } catch (PDOException $e) {
     die("A system error occurred.");
 }
 
-$invoices = [];
-try {
-    $stmt = $pdo->prepare("
-        SELECT id, invoice_number, amount, status, due_date, created_at 
-        FROM invoices 
-        WHERE user_id = :uid 
-        ORDER BY created_at DESC
-    ");
-    $stmt->execute(['uid' => $_SESSION['user_id']]);
-    $invoices = $stmt->fetchAll();
-} catch (PDOException $e) {
-    error_log("Invoices fetch error: " . $e->getMessage());
-}
-
-$page_title = 'Invoices';
-$header_title = 'Billing & Payments';
+$page_title = 'Billing & Invoices';
+$header_title = 'Financial Ledger';
 
 include 'includes/header.php';
 ?>
@@ -92,173 +96,263 @@ include 'includes/header.php';
     .page-title { font-family: var(--font-head); font-size: 36px; font-weight: 800; color: var(--text); letter-spacing: -.03em; margin-bottom: 8px; }
     .page-sub { font-size: 16px; color: var(--text-muted); }
 
-    .alert { padding: 16px; border-radius: 8px; margin-bottom: 24px; font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 8px; }
+    .alert { padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 12px; }
     .alert-success { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
     .alert-error { background: rgba(248,113,113,0.1); color: var(--accent-red); border: 1px solid rgba(248,113,113,0.2); }
 
-    .wallet-card { background: linear-gradient(135deg, var(--bg2), var(--surface)); border: 1px solid var(--border-strong); border-radius: 16px; padding: 32px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 10px 30px rgba(0,0,0,0.1); }
-    .wallet-label { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
-    .wallet-balance { font-family: var(--font-head); font-size: 40px; font-weight: 800; color: var(--text); }
-    .wallet-actions { display: flex; gap: 16px; }
+    /* Action Buttons */
+    .btn-action { padding: 12px 24px; border-radius: 8px; font-family: var(--font-body); font-size: 14px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; text-decoration: none; transition: 0.2s; border: none; }
+    .btn-outline { background: transparent; border: 1px solid var(--border-strong); color: var(--text); }
+    .btn-outline:hover { background: var(--surface2); }
+    .btn-primary-action { background: var(--accent2); color: #fff; box-shadow: 0 4px 15px var(--accent-glow); }
+    .btn-primary-action:hover { filter: brightness(1.1); transform: translateY(-1px); }
 
-    .table-container { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; transition: background 0.3s, border-color 0.3s; }
-    .table-controls { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; gap: 16px; overflow-x: auto; white-space: nowrap; }
-    .filter-tab { font-size: 14px; font-weight: 500; color: var(--text-muted); text-decoration: none; padding: 6px 12px; border-radius: 6px; transition: all 0.2s; cursor: pointer; }
-    .filter-tab:hover { color: var(--text); background: rgba(100,116,139,0.1); }
-    .filter-tab.active { background: rgba(59,130,246,0.1); color: var(--accent2); }
+    .table-container { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .toolbar-header { padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: rgba(0,0,0,0.1); }
 
     table { width: 100%; border-collapse: collapse; text-align: left; }
-    th { padding: 16px 24px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.1em; border-bottom: 1px solid var(--border-strong); background: rgba(100,116,139,0.03); }
-    td { padding: 20px 24px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: middle; }
+    th { padding: 16px 24px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border-strong); background: rgba(100,116,139,0.03); }
+    td { padding: 20px 24px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: middle; color: var(--text); }
     tr:last-child td { border-bottom: none; }
-
-    .inv-number { font-family: var(--font-mono); font-weight: 600; color: var(--text); font-size: 14px; display: flex; align-items: center; gap: 8px; }
-    .inv-date { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
-    .inv-amount { font-family: var(--font-mono); font-size: 16px; font-weight: 600; color: var(--text); }
+    tr:hover td { background: rgba(139,92,246,0.02); }
 
     .badge { padding: 4px 10px; border-radius: 100px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-family: var(--font-mono); display: inline-block; white-space: nowrap; }
-    .badge-paid { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
-    .badge-unpaid { background: rgba(251,146,60,0.1); color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.2); }
-    .badge-cancelled { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+    .badge-Paid { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
+    .badge-Unpaid { background: rgba(251,146,60,0.1); color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.2); }
+    .badge-Cancelled { background: rgba(248,113,113,0.1); color: var(--accent-red); border: 1px solid rgba(248,113,113,0.2); }
+    .badge-Refunded { background: rgba(167,139,250,0.1); color: var(--accent2); border: 1px solid rgba(167,139,250,0.2); }
 
-    .btn-pay { padding: 8px 16px; background: var(--accent); color: #fff; border: none; border-radius: 6px; font-weight: 600; font-size: 13px; cursor: pointer; transition: all 0.2s; }
-    .btn-pay:hover { background: #2563eb; transform: translateY(-1px); }
+    .table-btn { padding: 8px 16px; background: var(--surface2); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; transition: 0.2s; display: inline-block; }
+    .table-btn:hover { background: var(--accent2); color: #fff; border-color: var(--accent2); }
+    
+    .btn-pay { background: rgba(34,211,238,0.1); color: var(--accent-green); border-color: rgba(34,211,238,0.3); }
+    .btn-pay:hover { background: var(--accent-green); color: #000; border-color: var(--accent-green); }
 
-    @media (max-width: 768px) {
-        .wallet-card { flex-direction: column; align-items: flex-start; gap: 24px; }
-    }
+    /* Modals */
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(5px); z-index: 9999; display: none; align-items: center; justify-content: center; opacity: 0; transition: opacity 0.3s; overflow-y: auto; padding: 20px; }
+    .modal-overlay.show { display: flex; opacity: 1; }
+    .modal-content { background: var(--surface); border: 1px solid var(--border-strong); border-radius: 16px; width: 100%; max-width: 600px; padding: 32px; box-shadow: 0 20px 50px rgba(0,0,0,0.5); margin: auto; }
+    
+    .input-amount { width: 100%; padding: 14px 16px; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text); font-family: var(--font-head); font-size: 20px; font-weight: 700; text-align: center; margin-bottom: 16px; outline: none; transition: 0.2s; }
+    .input-amount:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+    
+    .form-group { margin-bottom: 16px; text-align: left; }
+    .form-group label { display: block; font-size: 11px; font-weight: 600; color: var(--text-muted); font-family: var(--font-mono); text-transform: uppercase; margin-bottom: 6px; }
+    .form-group input, .form-group select { width: 100%; padding: 12px 14px; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 8px; color: var(--text); font-family: var(--font-body); font-size: 14px; outline: none; transition: 0.2s; }
+    .form-group input:focus, .form-group select:focus { border-color: var(--accent); }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 </style>
 
 <div class="content-area">
     
     <div class="page-header">
         <div>
-            <h1 class="page-title">Invoices</h1>
-            <p class="page-sub">View and pay your billing statements.</p>
+            <h1 class="page-title">Billing History</h1>
+            <p class="page-sub">Manage your wallet, invoices, and billing profile.</p>
         </div>
     </div>
 
-    <?php if ($error): ?>
-        <div class="alert alert-error"><i class="fa-solid fa-circle-exclamation"></i> <?= htmlspecialchars($error) ?></div>
-    <?php endif; ?>
     <?php if ($success): ?>
-        <div class="alert alert-success"><i class="fa-solid fa-check-circle"></i> <?= htmlspecialchars($success) ?></div>
+        <div class="alert alert-success"><i class="fa-solid fa-circle-check"></i> <?= htmlspecialchars($success) ?></div>
+    <?php endif; ?>
+    <?php if ($error): ?>
+        <div class="alert alert-error"><i class="fa-solid fa-triangle-exclamation"></i> <?= htmlspecialchars($error) ?></div>
     <?php endif; ?>
 
-    <div class="wallet-card">
+    <div style="background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 32px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px;">
         <div>
-            <div class="wallet-label">Available Wallet Balance</div>
-            <div class="wallet-balance">$<?= number_format($user['wallet_balance'], 2) ?></div>
+            <div style="font-size: 12px; color: var(--text-muted); text-transform: uppercase; font-family: var(--font-mono); font-weight: 600;">Available Wallet Balance</div>
+            <div style="font-size: 28px; font-weight: 800; color: var(--text); font-family: var(--font-head);">$<?= number_format($user['wallet_balance'] ?? 0, 2) ?> USD</div>
         </div>
-        <div class="wallet-actions">
-            <a href="billing.php" class="btn-ghost"><i class="fa-solid fa-gear"></i> Billing Settings</a>
-            <a href="billing.php?action=add_funds" class="btn-primary" style="text-decoration: none;"><i class="fa-solid fa-wallet"></i> Add Funds</a>
+        <div style="display: flex; gap: 12px;">
+            <button class="btn-outline btn-action" onclick="openBillingModal()"><i class="fa-solid fa-address-card"></i> Billing Settings</button>
+            <button class="btn-primary-action btn-action" onclick="openAddFundsModal()"><i class="fa-solid fa-plus"></i> Add Funds</button>
         </div>
     </div>
 
     <div class="table-container">
-        <div class="table-controls">
-            <a class="filter-tab active" data-filter="all">All Invoices</a>
-            <a class="filter-tab" data-filter="Unpaid">Unpaid</a>
-            <a class="filter-tab" data-filter="Paid">Paid</a>
-            <a class="filter-tab" data-filter="Cancelled">Cancelled</a>
+        <div class="toolbar-header">
+            <div style="font-weight: 600; color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent); margin-right: 8px;"></i> All Invoices</div>
         </div>
-        
+
         <table>
             <thead>
                 <tr>
-                    <th width="30%">Invoice</th>
-                    <th width="15%">Amount</th>
-                    <th width="20%">Due Date</th>
-                    <th width="15%">Status</th>
-                    <th width="20%">Action</th>
+                    <th width="15%">Invoice #</th>
+                    <th width="20%">Service / Description</th>
+                    <th width="20%">Billing Period</th>
+                    <th width="10%">Amount</th>
+                    <th width="10%">Status</th>
+                    <th width="10%">Issued</th>
+                    <th width="15%" style="text-align: right;">Action</th>
                 </tr>
             </thead>
-            <tbody id="invoices-table-body">
-                <?php foreach ($invoices as $inv): ?>
-                <tr class="inv-row" data-status="<?= htmlspecialchars($inv['status']) ?>">
-                    <td>
-                        <div class="inv-number">
-    <i class="fa-solid fa-file-invoice" style="color: var(--text-dim);"></i> 
-    <a href="view-invoice.php?id=<?= htmlspecialchars($inv['invoice_number']) ?>" style="color: var(--text); text-decoration: none; transition: color 0.2s;" onmouseover="this.style.color='var(--accent)'" onmouseout="this.style.color='var(--text)'">
-        <?= htmlspecialchars($inv['invoice_number']) ?>
-    </a>
-</div>
-                        <div class="inv-date">Issued: <?= date('M j, Y', strtotime($inv['created_at'])) ?></div>
+            <tbody>
+                <?php if (empty($invoices)): ?>
+                <tr>
+                    <td colspan="7" style="text-align: center; padding: 48px; color: var(--text-dim);">
+                        <i class="fa-solid fa-receipt" style="font-size: 32px; margin-bottom: 16px; opacity: 0.5;"></i><br>
+                        You have no billing history.
                     </td>
-                    <td class="inv-amount">$<?= number_format($inv['amount'], 2) ?></td>
-                    <td style="color: <?= (strtotime($inv['due_date']) < time() && $inv['status'] === 'Unpaid') ? 'var(--accent-red)' : 'var(--text-muted)' ?>; font-size: 13px;">
-                        <?= date('M j, Y', strtotime($inv['due_date'])) ?>
+                </tr>
+                <?php else: foreach ($invoices as $inv): 
+                    $is_wallet = (strpos($inv['invoice_number'], 'WAL-') === 0);
+                ?>
+                <tr>
+                    <td style="font-family: var(--font-mono); font-weight: 600;">
+                        <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" style="color: var(--accent2); text-decoration: none;">
+                            <?= htmlspecialchars($inv['invoice_number']) ?>
+                        </a>
                     </td>
                     <td>
-                        <span class="badge badge-<?= strtolower($inv['status']) ?>">
+                        <?php if($is_wallet): ?>
+                            <span style="color: var(--text-muted); font-size: 13px;"><i class="fa-solid fa-wallet" style="margin-right: 6px;"></i>Wallet Top-Up</span>
+                        <?php elseif($inv['domain']): ?>
+                            <div style="font-weight: 500; font-size: 13px;"><i class="fa-solid fa-server" style="color: var(--text-muted); font-size: 11px; margin-right: 6px;"></i><?= htmlspecialchars($inv['domain']) ?></div>
+                        <?php else: ?>
+                            <span style="color: var(--text-muted); font-size: 13px;">General Account</span>
+                        <?php endif; ?>
+                    </td>
+                    <td style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">
+                        <?php 
+                            if ($inv['period_start'] && $inv['period_end']) {
+                                echo date('M j, Y', strtotime($inv['period_start'])) . ' <i class="fa-solid fa-arrow-right" style="margin: 0 4px; opacity: 0.5;"></i> ' . date('M j, Y', strtotime($inv['period_end']));
+                            } else {
+                                echo "N/A";
+                            }
+                        ?>
+                    </td>
+                    <td style="font-family: var(--font-mono); font-weight: 600;">$<?= number_format($inv['amount'], 2) ?></td>
+                    <td>
+                        <span class="badge badge-<?= $inv['status'] ?>">
                             <?= htmlspecialchars($inv['status']) ?>
                         </span>
                     </td>
-                    <td>
-                        <?php if ($inv['status'] === 'Unpaid'): ?>
-                            <form method="POST" action="invoices.php" style="margin: 0;">
-                                <input type="hidden" name="invoice_id" value="<?= htmlspecialchars($inv['id']) ?>">
-                                <button type="submit" name="pay_invoice" class="btn-pay">Pay from Wallet</button>
-                            </form>
-                        <?php elseif ($inv['status'] === 'Paid'): ?>
-                            <span style="color: var(--text-dim); font-size: 13px;"><i class="fa-solid fa-check"></i> Settled</span>
+                    <td style="color: var(--text-muted); font-size: 13px;">
+                        <?= date('M j, Y', strtotime($inv['created_at'])) ?>
+                    </td>
+                    <td style="text-align: right;">
+                        <?php if($inv['status'] === 'Unpaid'): ?>
+                            <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" class="table-btn btn-pay"><i class="fa-solid fa-credit-card"></i> Pay Now</a>
                         <?php else: ?>
-                            <span style="color: var(--text-dim); font-size: 13px;"><i class="fa-solid fa-ban"></i> Cancelled</span>
+                            <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" class="table-btn"><i class="fa-solid fa-eye"></i> View</a>
                         <?php endif; ?>
                     </td>
                 </tr>
-                <?php endforeach; ?>
-                
-                <tr id="empty-state" style="display: <?= empty($invoices) ? 'table-row' : 'none' ?>;">
-                    <td colspan="5" style="text-align: center; padding: 48px; color: var(--text-dim);">
-                        <i class="fa-solid fa-receipt" style="font-size: 32px; margin-bottom: 16px; opacity: 0.5;"></i><br>
-                        <span id="empty-state-text">No invoices found.</span>
-                    </td>
-                </tr>
+                <?php endforeach; endif; ?>
             </tbody>
         </table>
     </div>
 
 </div>
 
+<div class="modal-overlay" id="addFundsModal">
+    <div class="modal-content" style="text-align: center;">
+        <h3 style="font-family: var(--font-head); margin-bottom: 8px;">Top Up Wallet</h3>
+        <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">Enter the amount of USD you want to add.</p>
+        
+        <form method="POST" action="add_funds.php">
+            <input type="number" name="amount" class="input-amount" min="1" max="5000" step="1" placeholder="$10.00" required>
+            <div style="display: flex; gap: 8px; margin-top: 16px;">
+                <button type="button" class="btn-outline btn-action" onclick="closeAddFundsModal()" style="flex: 1; justify-content: center;">Cancel</button>
+                <button type="submit" class="btn-primary-action btn-action" style="flex: 1; justify-content: center;">Create Invoice</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="modal-overlay" id="billingModal">
+    <div class="modal-content">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+            <h3 style="font-family: var(--font-head);">Billing Profile</h3>
+            <button onclick="closeBillingModal()" style="background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer;"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        
+        <form method="POST" action="invoices.php">
+            
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Account Type</label>
+                    <select name="billing_type" onchange="toggleCompanyField(this.value)">
+                        <option value="individual" <?= ($user['billing_type'] ?? '') == 'individual' ? 'selected' : '' ?>>Personal / Individual</option>
+                        <option value="company" <?= ($user['billing_type'] ?? '') == 'company' ? 'selected' : '' ?>>Business / Company</option>
+                    </select>
+                </div>
+                <div class="form-group" id="companyField" style="display: <?= ($user['billing_type'] ?? '') == 'company' ? 'block' : 'none' ?>;">
+                    <label>Company Name</label>
+                    <input type="text" name="company_name" value="<?= htmlspecialchars($user['company_name'] ?? '') ?>" placeholder="Your Company LLC">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Billing Email</label>
+                <input type="email" name="billing_email" value="<?= htmlspecialchars($user['billing_email'] ?? $user['email']) ?>" required>
+            </div>
+
+            <div class="form-group">
+                <label>Street Address Line 1</label>
+                <input type="text" name="address_line1" value="<?= htmlspecialchars($user['address_line1'] ?? '') ?>" placeholder="123 Main St" required>
+            </div>
+            
+            <div class="form-group">
+                <label>Street Address Line 2 (Optional)</label>
+                <input type="text" name="address_line2" value="<?= htmlspecialchars($user['address_line2'] ?? '') ?>" placeholder="Apt, Suite, Bldg.">
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>City</label>
+                    <input type="text" name="city" value="<?= htmlspecialchars($user['city'] ?? '') ?>" placeholder="New York" required>
+                </div>
+                <div class="form-group">
+                    <label>State / Province</label>
+                    <input type="text" name="state_province" value="<?= htmlspecialchars($user['state_province'] ?? '') ?>" placeholder="NY" required>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>ZIP / Postal Code</label>
+                    <input type="text" name="postal_code" value="<?= htmlspecialchars($user['postal_code'] ?? '') ?>" placeholder="10001" required>
+                </div>
+                <div class="form-group">
+                    <label>Country</label>
+                    <input type="text" name="country" value="<?= htmlspecialchars($user['country'] ?? '') ?>" placeholder="United States" required>
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Tax ID / VAT Number (Optional)</label>
+                <input type="text" name="tax_id" value="<?= htmlspecialchars($user['tax_id'] ?? '') ?>" placeholder="Company Tax ID">
+            </div>
+            
+            <div style="margin-top: 24px; text-align: right;">
+                <button type="button" class="btn-outline btn-action" onclick="closeBillingModal()" style="margin-right: 8px;">Cancel</button>
+                <button type="submit" name="update_billing" class="btn-primary-action btn-action">Save Profile</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-    const filterTabs = document.querySelectorAll('.filter-tab');
-    const invRows = document.querySelectorAll('.inv-row');
-    const emptyState = document.getElementById('empty-state');
-    const emptyStateText = document.getElementById('empty-state-text');
+    function openAddFundsModal() { document.getElementById('addFundsModal').classList.add('show'); }
+    function closeAddFundsModal() { document.getElementById('addFundsModal').classList.remove('show'); }
 
-    filterTabs.forEach(tab => {
-        tab.addEventListener('click', (e) => {
-            e.preventDefault();
-            
-            filterTabs.forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
-            
-            const filterValue = tab.getAttribute('data-filter');
-            let visibleCount = 0;
+    function openBillingModal() { document.getElementById('billingModal').classList.add('show'); }
+    function closeBillingModal() { document.getElementById('billingModal').classList.remove('show'); }
 
-            invRows.forEach(row => {
-                const status = row.getAttribute('data-status');
+    function toggleCompanyField(val) {
+        document.getElementById('companyField').style.display = (val === 'company') ? 'block' : 'none';
+    }
 
-                if (filterValue === 'all' || status === filterValue) {
-                    row.style.display = '';
-                    visibleCount++;
-                } else {
-                    row.style.display = 'none';
-                }
-            });
-
-            if (visibleCount === 0) {
-                emptyState.style.display = '';
-                emptyStateText.textContent = filterValue === 'all' ? 'No invoices found.' : `No ${filterValue.toLowerCase()} invoices found.`;
-            } else {
-                emptyState.style.display = 'none';
+    // Close modals on outside click
+    document.querySelectorAll('.modal-overlay').forEach(modal => {
+        modal.addEventListener('click', function(e) {
+            if (e.target === this) {
+                this.classList.remove('show');
             }
         });
     });
-});
 </script>
 
 <?php include 'includes/footer.php'; ?>

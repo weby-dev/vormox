@@ -17,23 +17,66 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { he
 
 $success = ''; $error = '';
 
-// --- UPDATE INVOICE STATUS ---
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_status'])) {
-    $invoice_id = filter_input(INPUT_POST, 'invoice_id', FILTER_VALIDATE_INT);
-    $new_status = filter_input(INPUT_POST, 'status', FILTER_SANITIZE_SPECIAL_CHARS);
+// --- HANDLE POST: BULK UPDATE INVOICE STATUS ---
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_update_invoices'])) {
+    $selected_invoices = $_POST['selected_invoices'] ?? [];
+    $new_status = filter_input(INPUT_POST, 'invoice_status', FILTER_SANITIZE_SPECIAL_CHARS);
+    $valid_inv_statuses = ['Paid', 'Unpaid', 'Cancelled'];
     
-    $valid_statuses = ['Paid', 'Unpaid', 'Cancelled', 'Refunded'];
-    
-    if ($invoice_id && in_array($new_status, $valid_statuses)) {
+    if (!empty($selected_invoices) && in_array($new_status, $valid_inv_statuses)) {
         try {
-            $stmt = $pdo->prepare("UPDATE invoices SET status = :status WHERE id = :id");
-            $stmt->execute(['status' => $new_status, 'id' => $invoice_id]);
-            $success = "Invoice status updated successfully to " . strtoupper($new_status) . ".";
+            $processed = 0;
+            foreach ($selected_invoices as $inv_id) {
+                $pdo->beginTransaction();
+                
+                $chkStmt = $pdo->prepare("
+                    SELECT i.status, i.panel_id, i.type, i.amount, i.user_id, p.billing_cycle, p.expiry_date 
+                    FROM invoices i 
+                    LEFT JOIN user_panels p ON i.panel_id = p.id 
+                    WHERE i.id = ? FOR UPDATE
+                ");
+                $chkStmt->execute([$inv_id]);
+                $invData = $chkStmt->fetch();
+                
+                // IF MARKING AS PAID
+                if ($new_status === 'Paid' && $invData && $invData['status'] !== 'Paid') {
+                    
+                    // ROUTE A: Wallet Top-Up
+                    if ($invData['type'] === 'topup' || strpos($invData['invoice_number'] ?? '', 'WAL-') === 0) {
+                        $pdo->prepare("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?")
+                            ->execute([$invData['amount'], $invData['user_id']]);
+                    }
+                    // ROUTE B: Infrastructure Order/Renew
+                    elseif (!empty($invData['panel_id'])) {
+                        $cycle = $invData['billing_cycle'] ?? 'monthly';
+                        $current_expiry = $invData['expiry_date'];
+                        
+                        $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
+                        
+                        $months_to_add = 1;
+                        if ($cycle === 'quarterly') $months_to_add = 3;
+                        if ($cycle === 'semi_annually') $months_to_add = 6;
+                        if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
+                        
+                        $new_expiry = date('Y-m-d H:i:s', strtotime("+$months_to_add months", $base_time));
+                        
+                        $pdo->prepare("UPDATE user_panels SET expiry_date = ?, status = 'active' WHERE id = ?")
+                            ->execute([$new_expiry, $invData['panel_id']]);
+                    }
+                }
+                
+                $pdo->prepare("UPDATE invoices SET status = ? WHERE id = ?")->execute([$new_status, $inv_id]);
+                $pdo->commit();
+                $processed++;
+            }
+            
+            $success = "Successfully updated $processed invoice(s). Extensions and Wallet top-ups applied where necessary.";
         } catch (PDOException $e) {
-            $error = "Failed to update invoice status.";
+            if ($pdo->inTransaction()) { $pdo->rollBack(); }
+            $error = "Database error updating invoice statuses.";
         }
     } else {
-        $error = "Invalid status selected.";
+        $error = "Please select at least one invoice and a valid status.";
     }
 }
 
@@ -49,24 +92,20 @@ $adminStmt = $pdo->prepare("SELECT first_name, last_name FROM admins WHERE id = 
 $adminStmt->execute(['id' => $_SESSION['admin_id']]);
 $admin = $adminStmt->fetch();
 
-// --- FETCH FINANCIAL STATS & INVOICES ---
+// --- FETCH ALL INVOICES ---
 try {
-    $totalPaid = $pdo->query("SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'Paid'")->fetchColumn();
-    $totalUnpaid = $pdo->query("SELECT COALESCE(SUM(amount), 0) FROM invoices WHERE status = 'Unpaid'")->fetchColumn();
-    $totalInvoices = $pdo->query("SELECT COUNT(*) FROM invoices")->fetchColumn();
-
-    $invoicesStmt = $pdo->query("
+    $invStmt = $pdo->query("
         SELECT i.*, u.first_name, u.last_name, u.email 
         FROM invoices i 
         JOIN users u ON i.user_id = u.id 
         ORDER BY i.created_at DESC
     ");
-    $invoices = $invoicesStmt->fetchAll();
+    $invoicesList = $invStmt->fetchAll();
 } catch (PDOException $e) {
     die("Database error while loading invoices.");
 }
 
-$page_title = 'Financial Invoices';
+$page_title = 'Global Billing & Invoices';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
@@ -111,38 +150,36 @@ $page_title = 'Financial Invoices';
 
     .content-area { padding: 48px; z-index: 1; flex: 1; max-width: 1600px; margin: 0 auto; width: 100%; }
 
-    /* Stats Grid */
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; margin-bottom: 32px; }
-    .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 24px; position: relative; overflow: hidden; transition: transform 0.2s, box-shadow 0.2s; }
-    .stat-card:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(0,0,0,0.2); }
-    [data-theme="light"] .stat-card { box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }
-    .stat-icon { position: absolute; top: 24px; right: 24px; width: 40px; height: 40px; border-radius: 10px; background: rgba(139,92,246,0.1); color: var(--accent2); display: flex; align-items: center; justify-content: center; font-size: 18px; }
-    .stat-label { font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-muted); margin-bottom: 12px; }
-    .stat-value { font-family: var(--font-head); font-size: 36px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; margin-bottom: 24px; }
+    .card-title { padding: 20px 24px; border-bottom: 1px solid var(--border); font-family: var(--font-head); font-size: 16px; font-weight: 700; display: flex; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.1); color: var(--text); }
 
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; }
-    .card-title { padding: 24px; border-bottom: 1px solid var(--border); font-family: var(--font-head); font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 10px; background: rgba(0,0,0,0.1); }
-    
     table { width: 100%; border-collapse: collapse; text-align: left; }
     th { padding: 16px 24px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; border-bottom: 1px solid var(--border-strong); }
-    td { padding: 20px 24px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: middle; transition: background 0.2s; }
+    td { padding: 16px 24px; border-bottom: 1px solid var(--border); font-size: 14px; vertical-align: middle; transition: background 0.2s; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: rgba(139,92,246,0.02); }
 
-    .table-link { text-decoration: none; color: inherit; display: block; transition: all 0.2s; }
-    .table-link:hover .link-title { color: var(--accent2); }
+    input[type="checkbox"] { appearance: none; width: 18px; height: 18px; border: 2px solid var(--border-strong); border-radius: 4px; background: var(--bg); cursor: pointer; position: relative; transition: 0.2s; }
+    input[type="checkbox"]:checked { background: var(--accent2); border-color: var(--accent2); }
+    input[type="checkbox"]:checked::after { content: '\f00c'; font-family: 'Font Awesome 6 Free'; font-weight: 900; color: #fff; font-size: 10px; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); }
 
-    .status-select { padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none; text-transform: uppercase; transition: 0.3s; cursor: pointer; }
+    .btn-bulk { background: rgba(139,92,246,0.1); color: var(--accent2); border: 1px solid rgba(139,92,246,0.3); padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; font-size: 13px; font-family: var(--font-body); }
+    .btn-bulk:hover { background: var(--accent2); color: #fff; }
+
+    .status-select { padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border-strong); border-radius: 6px; color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none; transition: 0.3s; cursor: pointer; margin-right: 8px; }
     .status-select:focus { border-color: var(--accent); }
-    .inline-form { display: flex; gap: 8px; align-items: center; margin: 0; }
 
     .badge { padding: 4px 10px; border-radius: 100px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-family: var(--font-mono); display: inline-block; white-space: nowrap; }
     .badge-Paid { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
     .badge-Unpaid { background: rgba(251,146,60,0.1); color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.2); }
+    .badge-Cancelled { background: rgba(248,113,113,0.1); color: var(--accent-red); border: 1px solid rgba(248,113,113,0.2); }
     .badge-Refunded { background: rgba(167,139,250,0.1); color: var(--accent2); border: 1px solid rgba(167,139,250,0.2); }
-    .badge-Cancelled { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
 
-    /* Toast Notifications */
+    .badge-order { background: rgba(59,130,246,0.1); color: #3b82f6; border: 1px solid rgba(59,130,246,0.2); }
+    .badge-renew { background: rgba(167,139,250,0.1); color: var(--accent2); border: 1px solid rgba(167,139,250,0.2); }
+    .badge-topup { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
+
+    /* Toasts */
     #toast-container { position: fixed; bottom: 32px; right: 32px; z-index: 9999; display: flex; flex-direction: column; gap: 12px; }
     .toast { padding: 16px 24px; border-radius: 8px; font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 12px; color: var(--text); box-shadow: 0 10px 30px rgba(0,0,0,0.3); animation: slideIn 0.3s ease forwards; min-width: 300px; font-family: var(--font-body); background: var(--surface); }
     .toast.success { border: 1px solid rgba(34,211,238,0.3); border-left: 4px solid var(--accent-green); }
@@ -155,19 +192,13 @@ $page_title = 'Financial Invoices';
 <div id="toast-container"></div>
 
 <aside>
-  <a href="index.php" class="logo">
-    <div class="logo-icon"><i class="fa-solid fa-shield-halved"></i></div>
-    Vormox <span>Admin</span>
-  </a>
+  <a href="index.php" class="logo"><div class="logo-icon"><i class="fa-solid fa-shield-halved"></i></div>Vormox <span>Admin</span></a>
   <nav>
     <div class="nav-label">Core</div>
     <a href="index.php" class="nav-item <?= $current_page == 'index.php' ? 'active' : '' ?>"><i class="fa-solid fa-chart-pie"></i> Dashboard</a>
-    
     <a href="orders.php" class="nav-item <?= $current_page == 'orders.php' ? 'active' : '' ?>">
         <i class="fa-solid fa-inbox"></i> Pending Orders 
-        <?php if(isset($pendingOrdersCount) && $pendingOrdersCount > 0): ?>
-            <span style="background: var(--accent-orange); color: #fff; font-size: 10px; padding: 2px 6px; border-radius: 10px; margin-left: auto; font-weight: 800;"><?= $pendingOrdersCount ?></span>
-        <?php endif; ?>
+        <?php if($pendingOrdersCount > 0): ?><span style="background: var(--accent-orange); color: #fff; font-size: 10px; padding: 2px 6px; border-radius: 10px; margin-left: auto; font-weight: 800;"><?= $pendingOrdersCount ?></span><?php endif; ?>
     </a>
     
     <a href="users.php" class="nav-item <?= $current_page == 'users.php' ? 'active' : '' ?>"><i class="fa-solid fa-users"></i> Users & Clients</a>
@@ -183,11 +214,7 @@ $page_title = 'Financial Invoices';
     <a href="settings.php" class="nav-item <?= $current_page == 'settings.php' ? 'active' : '' ?>"><i class="fa-solid fa-gear"></i> Global Settings</a>
   </nav>
   <div class="sidebar-footer">
-    <?php if($admin): ?>
-    <div style="padding: 0 16px 16px; font-size: 13px; color: var(--text-muted);">
-        Logged in as<br><strong style="color: var(--text);"><?= htmlspecialchars($admin['first_name'] . ' ' . $admin['last_name']) ?></strong>
-    </div>
-    <?php endif; ?>
+    <?php if($admin): ?><div style="padding: 0 16px 16px; font-size: 13px; color: var(--text-muted);">Logged in as<br><strong style="color: var(--text);"><?= htmlspecialchars($admin['first_name'] . ' ' . $admin['last_name']) ?></strong></div><?php endif; ?>
     <a href="logout.php" class="nav-item" style="color: var(--accent-red);"><i class="fa-solid fa-arrow-right-from-bracket"></i> End Session</a>
   </div>
 </aside>
@@ -195,7 +222,7 @@ $page_title = 'Financial Invoices';
 <main>
   <div class="grid-bg"></div>
   <header>
-    <div class="header-title">Financial Ledgers</div>
+    <div class="header-title">Financial Ledger</div>
     <div style="display: flex; gap: 16px; align-items: center;">
         <span style="font-family: var(--font-mono); font-size: 12px; color: var(--text-dim);">IP: <?= htmlspecialchars($user_ip) ?></span>
         <button class="theme-toggle" id="adminThemeToggle" aria-label="Toggle Theme">
@@ -207,83 +234,75 @@ $page_title = 'Financial Invoices';
 
   <div class="content-area">
     
-    <div class="stats-grid">
-        <div class="stat-card">
-            <div class="stat-icon" style="background: rgba(34,211,238,0.1); color: var(--accent-green);"><i class="fa-solid fa-wallet"></i></div>
-            <div class="stat-label">Total Revenue Collected</div>
-            <div class="stat-value">$<?= number_format($totalPaid, 2) ?></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon" style="background: rgba(251,146,60,0.1); color: var(--accent-orange);"><i class="fa-solid fa-hourglass-half"></i></div>
-            <div class="stat-label">Pending Collection</div>
-            <div class="stat-value">$<?= number_format($totalUnpaid, 2) ?></div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-icon"><i class="fa-solid fa-file-invoice"></i></div>
-            <div class="stat-label">Total Invoices Generated</div>
-            <div class="stat-value"><?= number_format($totalInvoices) ?></div>
-        </div>
-    </div>
-
-    <div class="card">
+    <form method="POST" action="invoices.php" class="card">
         <div class="card-title">
-            <div style="display: flex; align-items: center; gap: 10px;">
-                <i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent);"></i> All Invoices
+            <div style="color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent-green); margin-right: 8px;"></i> Global Billing History</div>
+            
+            <div style="display: flex; align-items: center;">
+                <select name="invoice_status" class="status-select" required>
+                    <option value="">-- Bulk Update Status --</option>
+                    <option value="Paid">Mark as Paid</option>
+                    <option value="Unpaid">Mark as Unpaid</option>
+                    <option value="Cancelled">Cancel Invoices</option>
+                </select>
+                <button type="submit" name="bulk_update_invoices" class="btn-bulk" onclick="return confirm('Update status for selected invoices? Note: Marking as Paid will automatically process wallet top-ups and panel extensions.');"><i class="fa-solid fa-check"></i> Apply</button>
             </div>
         </div>
+        
         <table>
             <thead>
                 <tr>
-                    <th width="15%">Invoice ID</th>
-                    <th width="25%">Client Identity</th>
+                    <th width="5%"><input type="checkbox" id="selectAllInvoices" title="Select All Invoices"></th>
+                    <th width="15%">Invoice #</th>
+                    <th width="10%">Type</th>
+                    <th width="25%">Client Profile</th>
+                    <th width="15%">Billing Period</th>
                     <th width="15%">Amount</th>
-                    <th width="15%">Current Status</th>
-                    <th width="15%">Update State</th>
-                    <th width="15%">Date Issued</th>
+                    <th width="10%">Status</th>
+                    <th width="5%">Issued</th>
                 </tr>
             </thead>
             <tbody>
-                <?php if(empty($invoices)): ?>
-                    <tr><td colspan="6" style="text-align: center; padding: 48px; color: var(--text-dim);">No invoices found in the database.</td></tr>
-                <?php else: foreach($invoices as $inv): ?>
+                <?php if(empty($invoicesList)): ?>
+                    <tr><td colspan="8" style="text-align: center; padding: 48px; color: var(--text-dim);">No invoices found in the system.</td></tr>
+                <?php else: foreach($invoicesList as $inv): ?>
                     <tr>
-                        <td>
-                            <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" class="table-link">
-                                <div class="link-title" style="font-weight: 600; font-family: var(--font-mono); font-size: 13px; color: var(--text);"><i class="fa-solid fa-link" style="font-size: 11px; margin-right: 6px; color: var(--text-muted);"></i><?= htmlspecialchars($inv['invoice_number']) ?></div>
+                        <td><input type="checkbox" name="selected_invoices[]" value="<?= $inv['id'] ?>" class="invoice-checkbox"></td>
+                        <td style="font-family: var(--font-mono); font-weight: 600; color: var(--text);">
+                            <a href="view-invoice.php?id=<?= urlencode($inv['invoice_number']) ?>" style="color: var(--accent2); text-decoration: none; transition: 0.2s;">
+                                <?= htmlspecialchars($inv['invoice_number']) ?>
                             </a>
+                            <?php if(!empty($inv['panel_id'])): ?>
+                                <div style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Panel #<?= $inv['panel_id'] ?></div>
+                            <?php endif; ?>
                         </td>
                         <td>
-                            <div style="font-size: 14px; font-weight: 600; color: var(--text);"><?= htmlspecialchars($inv['first_name'] . ' ' . $inv['last_name']) ?></div>
-                            <div style="font-size: 12px; color: var(--text-muted); font-family: var(--font-mono);"><?= htmlspecialchars($inv['email']) ?></div>
-                        </td>
-                        <td style="font-family: var(--font-mono); font-weight: 700; font-size: 15px; color: <?= $inv['status'] === 'Paid' ? 'var(--accent-green)' : 'var(--text)' ?>;">
-                            $<?= number_format($inv['amount'], 2) ?>
-                        </td>
-                        <td>
-                            <span class="badge badge-<?= htmlspecialchars($inv['status']) ?>">
-                                <?= htmlspecialchars($inv['status']) ?>
+                            <span class="badge badge-<?= htmlspecialchars($inv['type'] ?? 'order') ?>">
+                                <?= htmlspecialchars($inv['type'] ?? 'order') ?>
                             </span>
                         </td>
                         <td>
-                            <form method="POST" action="invoices.php" class="inline-form">
-                                <input type="hidden" name="invoice_id" value="<?= htmlspecialchars($inv['id']) ?>">
-                                <select name="status" class="status-select" onchange="this.form.submit()">
-                                    <option value="Unpaid" <?= $inv['status']=='Unpaid'?'selected':'' ?>>Unpaid</option>
-                                    <option value="Paid" <?= $inv['status']=='Paid'?'selected':'' ?>>Paid</option>
-                                    <option value="Refunded" <?= $inv['status']=='Refunded'?'selected':'' ?>>Refunded</option>
-                                    <option value="Cancelled" <?= $inv['status']=='Cancelled'?'selected':'' ?>>Cancelled</option>
-                                </select>
-                                <input type="hidden" name="update_status" value="1">
-                            </form>
+                            <div style="font-size: 13px; font-weight: 500; color: var(--text);"><?= htmlspecialchars($inv['first_name'] . ' ' . $inv['last_name']) ?></div>
+                            <div style="font-size: 11px; color: var(--text-muted); font-family: var(--font-mono);"><?= htmlspecialchars($inv['email']) ?></div>
                         </td>
-                        <td style="color: var(--text-dim); font-size: 13px;">
-                            <?= date('M j, Y', strtotime($inv['created_at'])) ?>
+                        <td style="font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);">
+                            <?php 
+                                if ($inv['period_start'] && $inv['period_end']) {
+                                    echo date('M j, Y', strtotime($inv['period_start'])) . ' <i class="fa-solid fa-arrow-right" style="margin: 0 4px; opacity: 0.5;"></i> ' . date('M j, Y', strtotime($inv['period_end']));
+                                } else {
+                                    echo "N/A";
+                                }
+                            ?>
                         </td>
+                        <td style="font-family: var(--font-mono); font-weight: 600; color: var(--text);">$<?= number_format($inv['amount'], 2) ?></td>
+                        <td><span class="badge badge-<?= $inv['status'] ?>"><?= htmlspecialchars($inv['status']) ?></span></td>
+                        <td style="color: var(--text-dim); font-size: 12px; font-family: var(--font-mono);"><?= date('M j, Y', strtotime($inv['created_at'])) ?></td>
                     </tr>
                 <?php endforeach; endif; ?>
             </tbody>
         </table>
-    </div>
+    </form>
+
   </div>
 </main>
 
@@ -308,6 +327,7 @@ function showToast(type, message) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+    // Theme Toggle
     const toggle = document.getElementById('adminThemeToggle');
     if (toggle) {
         toggle.addEventListener('click', function() {
@@ -315,6 +335,14 @@ document.addEventListener('DOMContentLoaded', () => {
             const currentTheme = body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
             body.setAttribute('data-theme', currentTheme);
             localStorage.setItem('admin_theme', currentTheme);
+        });
+    }
+
+    // Checkboxes Check-All Logic
+    const selectAllInvoices = document.getElementById('selectAllInvoices');
+    if (selectAllInvoices) {
+        selectAllInvoices.addEventListener('change', function() {
+            document.querySelectorAll('.invoice-checkbox').forEach(cb => cb.checked = this.checked);
         });
     }
 });

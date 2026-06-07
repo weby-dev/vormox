@@ -1,5 +1,7 @@
 <?php
 session_start();
+
+// FIX: Changed from '../config.php' to 'config.php' since they are in the same directory
 require_once 'config.php';
 
 header('Content-Type: application/json');
@@ -18,8 +20,15 @@ if (!$domain) {
 }
 
 try {
-    // Check if the domain exists anywhere in the user_panels table
-    $stmt = $pdo->prepare("SELECT id FROM user_panels WHERE domain = :domain LIMIT 1");
+    // PRODUCTION READY CHECK: 
+    // Only block the domain if it is attached to a panel that is currently alive, pending, or suspended.
+    // Because you terminated 'cloud.siteworx.com', this will return false, making the domain available again!
+    $stmt = $pdo->prepare("
+        SELECT id FROM user_panels 
+        WHERE domain = :domain 
+        AND status IN ('payment_pending', 'pending', 'creating', 'active', 'restarting', 'suspended', 'error') 
+        LIMIT 1
+    ");
     $stmt->execute(['domain' => $domain]);
     
     if ($stmt->fetch()) {
