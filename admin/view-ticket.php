@@ -26,38 +26,55 @@ if (!$ticket_id) { header("Location: tickets.php"); exit; }
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     
     // Action 1: Add a Reply
+    // Replies live in ticket_messages (the only message table in the schema).
+    // is_staff_reply = 1 marks this as an admin/support reply, sender_id is
+    // the admin's id (it's not FK-constrained so collisions with users.id are
+    // resolved at render time via is_staff_reply).
     if (isset($_POST['submit_reply'])) {
-        $message = trim($_POST['message'] ?? '');
-        if (!empty($message)) {
+        $message = trim((string) ($_POST['message'] ?? ''));
+        if ($message === '') {
+            $error = "Reply message cannot be empty.";
+        } else {
             try {
-                // Insert the reply
-                $stmt = $pdo->prepare("INSERT INTO ticket_replies (ticket_id, admin_id, message, created_at) VALUES (:tid, :aid, :msg, CURRENT_TIMESTAMP)");
-                $stmt->execute(['tid' => $ticket_id, 'aid' => $_SESSION['admin_id'], 'msg' => $message]);
-                
-                // Update parent ticket status to Answered
-                $pdo->prepare("UPDATE tickets SET status = 'Answered', updated_at = CURRENT_TIMESTAMP WHERE id = :tid")->execute(['tid' => $ticket_id]);
-                
+                $pdo->beginTransaction();
+
+                $pdo->prepare("
+                    INSERT INTO ticket_messages (ticket_id, sender_id, message, is_staff_reply, created_at)
+                    VALUES (?, ?, ?, 1, NOW())
+                ")->execute([$ticket_id, $_SESSION['admin_id'], $message]);
+
+                // After staff replies, the ball is in the customer's court.
+                $pdo->prepare("
+                    UPDATE tickets
+                       SET status = 'Awaiting Reply', updated_at = NOW()
+                     WHERE id = ?
+                ")->execute([$ticket_id]);
+
+                $pdo->commit();
                 $success = "Reply posted successfully.";
             } catch (PDOException $e) {
+                if ($pdo->inTransaction()) { $pdo->rollBack(); }
+                error_log("Admin reply failed: " . $e->getMessage());
                 $error = "Failed to post reply.";
             }
-        } else {
-            $error = "Reply message cannot be empty.";
         }
     }
-    
-    // Action 2: Update Ticket Status
+
+    // Action 2: Update Ticket Status (canonical ENUM values only)
     if (isset($_POST['update_status'])) {
         $new_status = filter_input(INPUT_POST, 'status', FILTER_SANITIZE_SPECIAL_CHARS);
-        $valid_statuses = ['Open', 'Answered', 'Customer-Reply', 'Resolved', 'Closed'];
-        
-        if (in_array($new_status, $valid_statuses)) {
+        $valid_statuses = ['Open', 'In Progress', 'Awaiting Reply', 'Resolved', 'Closed'];
+
+        if (in_array($new_status, $valid_statuses, true)) {
             try {
-                $pdo->prepare("UPDATE tickets SET status = :status, updated_at = CURRENT_TIMESTAMP WHERE id = :tid")->execute(['status' => $new_status, 'tid' => $ticket_id]);
-                $success = "Ticket status updated to " . strtoupper($new_status) . ".";
+                $pdo->prepare("UPDATE tickets SET status = ?, updated_at = NOW() WHERE id = ?")
+                    ->execute([$new_status, $ticket_id]);
+                $success = "Ticket status updated to {$new_status}.";
             } catch (PDOException $e) {
                 $error = "Failed to update status.";
             }
+        } else {
+            $error = "Invalid status value.";
         }
     }
 }
@@ -74,37 +91,41 @@ $adminStmt = $pdo->prepare("SELECT first_name, last_name FROM admins WHERE id = 
 $adminStmt->execute(['id' => $_SESSION['admin_id']]);
 $admin = $adminStmt->fetch();
 
-// --- FETCH SPECIFIC TICKET & REPLIES ---
+// --- FETCH SPECIFIC TICKET & MESSAGES ---
+$messages = [];
 try {
     // Main Ticket
     $stmt = $pdo->prepare("
-        SELECT t.*, u.first_name, u.last_name, u.email 
-        FROM tickets t 
-        JOIN users u ON t.user_id = u.id 
-        WHERE t.id = :id LIMIT 1
+        SELECT t.*, u.first_name, u.last_name, u.email,
+               d.name AS department
+          FROM tickets t
+          JOIN users u ON t.user_id = u.id
+          LEFT JOIN support_departments d ON t.department_id = d.id
+         WHERE t.id = :id LIMIT 1
     ");
     $stmt->execute(['id' => $ticket_id]);
     $ticket = $stmt->fetch();
 
     if (!$ticket) { die("Ticket not found."); }
 
-    // Ticket Replies (Join with admins table to get staff names, and users table if client replied)
-    $repliesStmt = $pdo->prepare("
-        SELECT tr.*, 
-               a.first_name as admin_fn, a.last_name as admin_ln,
-               u.first_name as user_fn, u.last_name as user_ln 
-        FROM ticket_replies tr 
-        LEFT JOIN admins a ON tr.admin_id = a.id 
-        LEFT JOIN users u ON tr.user_id = u.id 
-        WHERE tr.ticket_id = :tid 
-        ORDER BY tr.created_at ASC
+    // All messages — original first, replies in time order. We join users
+    // ONLY when is_staff_reply=0 and admins ONLY when is_staff_reply=1 so the
+    // sender_id can't accidentally match a row in the wrong table.
+    $msgStmt = $pdo->prepare("
+        SELECT m.id, m.message, m.is_staff_reply, m.sender_id, m.created_at, m.attachment_path,
+               u.first_name AS user_fn,  u.last_name AS user_ln,
+               a.first_name AS admin_fn, a.last_name AS admin_ln
+          FROM ticket_messages m
+          LEFT JOIN users  u ON m.is_staff_reply = 0 AND m.sender_id = u.id
+          LEFT JOIN admins a ON m.is_staff_reply = 1 AND m.sender_id = a.id
+         WHERE m.ticket_id = ?
+         ORDER BY m.created_at ASC, m.id ASC
     ");
-    $repliesStmt->execute(['tid' => $ticket_id]);
-    $replies = $repliesStmt->fetchAll();
-
+    $msgStmt->execute([$ticket_id]);
+    $messages = $msgStmt->fetchAll();
 } catch (PDOException $e) {
-    // Failsafe if ticket_replies doesn't exist yet
-    $replies = [];
+    error_log("admin/view-ticket fetch failed: " . $e->getMessage());
+    if (!isset($ticket)) { die("Database error loading ticket."); }
 }
 
 $page_title = 'Ticket #' . $ticket['id'];
@@ -194,10 +215,11 @@ $page_title = 'Ticket #' . $ticket['id'];
     .reply-box textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
 
     .badge { padding: 4px 10px; border-radius: 100px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; font-family: var(--font-mono); display: inline-block; white-space: nowrap; }
-    .badge-Open { background: rgba(251,146,60,0.1); color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.2); }
-    .badge-Customer-Reply { background: rgba(248,113,113,0.1); color: var(--accent-red); border: 1px solid rgba(248,113,113,0.2); }
-    .badge-Answered { background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.2); }
-    .badge-Resolved, .badge-Closed { background: var(--surface2); color: var(--text-muted); border: 1px solid var(--border); }
+    .badge-Open            { background: rgba(96,165,250,0.12);  color: #60a5fa;            border: 1px solid rgba(96,165,250,0.25); }
+    .badge-In-Progress     { background: rgba(167,139,250,0.12); color: var(--accent);      border: 1px solid rgba(167,139,250,0.25); }
+    .badge-Awaiting-Reply  { background: rgba(251,146,60,0.12);  color: var(--accent-orange); border: 1px solid rgba(251,146,60,0.25); }
+    .badge-Resolved        { background: rgba(34,211,238,0.12);  color: var(--accent-green); border: 1px solid rgba(34,211,238,0.25); }
+    .badge-Closed          { background: var(--surface2);        color: var(--text-muted);   border: 1px solid var(--border); }
 
     /* Toasts */
     #toast-container { position: fixed; bottom: 32px; right: 32px; z-index: 9999; display: flex; flex-direction: column; gap: 12px; }
@@ -276,42 +298,47 @@ $page_title = 'Ticket #' . $ticket['id'];
         <div>
             <div class="card" style="margin-bottom: 0;">
                 
-                <!-- Original Ticket Message -->
-                <div class="msg-bubble">
-                    <div class="msg-header">
-                        <div class="msg-author">
-                            <div class="author-avatar avatar-user"><?= strtoupper(substr($ticket['first_name'], 0, 1)) ?></div>
-                            <?= htmlspecialchars($ticket['first_name'] . ' ' . $ticket['last_name']) ?>
+                <!-- Unified thread: original message + every reply, in order. -->
+                <?php if (empty($messages)): ?>
+                    <div class="msg-bubble">
+                        <div class="msg-body" style="color: var(--text-muted); font-style: italic;">
+                            This ticket has no messages yet.
                         </div>
-                        <div class="msg-date"><?= date('M j, Y - g:i A', strtotime($ticket['created_at'])) ?></div>
                     </div>
-                    <div class="msg-body"><?= htmlspecialchars($ticket['message'] ?? 'No original message found.') ?></div>
-                </div>
-
-                <!-- Replies Loop -->
-                <?php foreach($replies as $reply): 
-                    $isAdmin = !empty($reply['admin_id']);
+                <?php else: foreach ($messages as $msg):
+                    $isAdmin = !empty($msg['is_staff_reply']);
+                    if ($isAdmin) {
+                        $authorName = trim(($msg['admin_fn'] ?? '') . ' ' . ($msg['admin_ln'] ?? ''));
+                        if ($authorName === '') $authorName = 'Support';
+                    } else {
+                        $authorName = trim(($msg['user_fn'] ?? '') . ' ' . ($msg['user_ln'] ?? ''));
+                        if ($authorName === '') $authorName = trim(($ticket['first_name'] ?? '') . ' ' . ($ticket['last_name'] ?? '')) ?: 'Customer';
+                    }
+                    $initial = strtoupper(substr($authorName, 0, 1));
                 ?>
                 <div class="msg-bubble <?= $isAdmin ? 'msg-admin' : '' ?>">
                     <div class="msg-header">
                         <div class="msg-author">
                             <?php if ($isAdmin): ?>
                                 <div class="author-avatar avatar-admin"><i class="fa-solid fa-shield"></i></div>
-                                <?= htmlspecialchars($reply['admin_fn'] . ' ' . $reply['admin_ln']) ?> <span style="font-size: 11px; background: rgba(139,92,246,0.1); color: var(--accent2); padding: 2px 6px; border-radius: 4px; margin-left: 4px;">Staff</span>
                             <?php else: ?>
-                                <div class="author-avatar avatar-user"><?= strtoupper(substr($ticket['first_name'], 0, 1)) ?></div>
-                                <?= htmlspecialchars($ticket['first_name'] . ' ' . $ticket['last_name']) ?>
+                                <div class="author-avatar avatar-user"><?= htmlspecialchars($initial) ?></div>
+                            <?php endif; ?>
+                            <?= htmlspecialchars($authorName) ?>
+                            <?php if ($isAdmin): ?>
+                                <span style="font-size: 11px; background: rgba(139,92,246,0.1); color: var(--accent2); padding: 2px 6px; border-radius: 4px; margin-left: 4px;">Staff</span>
                             <?php endif; ?>
                         </div>
-                        <div class="msg-date"><?= date('M j, Y - g:i A', strtotime($reply['created_at'])) ?></div>
+                        <div class="msg-date"><?= date('M j, Y - g:i A', strtotime($msg['created_at'])) ?></div>
                     </div>
-                    <div class="msg-body"><?= htmlspecialchars($reply['message']) ?></div>
+                    <div class="msg-body"><?= nl2br(htmlspecialchars($msg['message'])) ?></div>
                 </div>
-                <?php endforeach; ?>
+                <?php endforeach; endif; ?>
             </div>
 
             <!-- Reply Box -->
-            <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?><?= csrf_field() ?>" class="reply-box">
+            <form method="POST" action="view-ticket.php?id=<?= (int)$ticket_id ?>" class="reply-box">
+                <?= csrf_field() ?>
                 <div style="font-family: var(--font-head); font-weight: 700; margin-bottom: 16px;"><i class="fa-solid fa-reply"></i> Add a Reply</div>
                 <textarea name="message" placeholder="Type your response here... Markdown/HTML is stripped for security." required></textarea>
                 <div style="text-align: right;">
@@ -327,21 +354,20 @@ $page_title = 'Ticket #' . $ticket['id'];
                 
                 <div class="meta-row"><span class="meta-label">Department</span><span class="meta-value"><?= htmlspecialchars($ticket['department'] ?? 'Support') ?></span></div>
                 <div class="meta-row"><span class="meta-label">Priority</span><span class="meta-value"><?= htmlspecialchars($ticket['priority'] ?? 'Low') ?></span></div>
-                <div class="meta-row"><span class="meta-label">Status</span><span class="badge badge-<?= htmlspecialchars($ticket['status']) ?>"><?= htmlspecialchars(str_replace('-', ' ', $ticket['status'])) ?></span></div>
+                <div class="meta-row"><span class="meta-label">Status</span><span class="badge badge-<?= htmlspecialchars(str_replace(' ', '-', $ticket['status'])) ?>"><?= htmlspecialchars($ticket['status']) ?></span></div>
                 <div class="meta-row" style="flex-direction: column; gap: 8px;">
                     <span class="meta-label">Client</span>
                     <a href="users.php" style="color: var(--accent2); text-decoration: none; font-weight: 600;"><i class="fa-solid fa-user-circle"></i> <?= htmlspecialchars($ticket['first_name'] . ' ' . $ticket['last_name']) ?></a>
                 </div>
                 
                 <div style="padding: 24px; background: rgba(0,0,0,0.1); border-top: 1px solid var(--border);">
-                    <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?><?= csrf_field() ?>">
+                    <form method="POST" action="view-ticket.php?id=<?= (int)$ticket_id ?>">
+                        <?= csrf_field() ?>
                         <label class="meta-label" style="display: block; margin-bottom: 8px;">Change Status</label>
                         <select name="status" class="status-select">
-                            <option value="Open" <?= $ticket['status']=='Open'?'selected':'' ?>>Open</option>
-                            <option value="Answered" <?= $ticket['status']=='Answered'?'selected':'' ?>>Answered</option>
-                            <option value="Customer-Reply" <?= $ticket['status']=='Customer-Reply'?'selected':'' ?>>Customer Reply</option>
-                            <option value="Resolved" <?= $ticket['status']=='Resolved'?'selected':'' ?>>Resolved</option>
-                            <option value="Closed" <?= $ticket['status']=='Closed'?'selected':'' ?>>Closed</option>
+                            <?php foreach (['Open','In Progress','Awaiting Reply','Resolved','Closed'] as $s): ?>
+                                <option value="<?= $s ?>" <?= $ticket['status'] === $s ? 'selected' : '' ?>><?= $s ?></option>
+                            <?php endforeach; ?>
                         </select>
                         <button type="submit" name="update_status" class="btn-block">Update Status</button>
                     </form>
