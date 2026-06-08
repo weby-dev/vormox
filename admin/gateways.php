@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 // --- FETCH DATA FOR NOTIFICATIONS ---
 $current_page = basename($_SERVER['PHP_SELF']);
 try {
@@ -39,7 +41,7 @@ $page_title = 'Payment Gateways';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />

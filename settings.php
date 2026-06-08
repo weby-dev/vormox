@@ -17,7 +17,8 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { he
 $success = ''; $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    
+    csrf_require();
+
     if (isset($_POST['update_company'])) {
         $app_name = trim(filter_input(INPUT_POST, 'app_name', FILTER_SANITIZE_SPECIAL_CHARS));
         $support_email = trim(filter_input(INPUT_POST, 'support_email', FILTER_SANITIZE_EMAIL));
@@ -206,7 +207,7 @@ $page_title = 'System Settings';
         
         <div class="card">
             <div class="card-title"><i class="fa-solid fa-building"></i> Company Details</div>
-            <form method="POST">
+            <form method="POST"><?= csrf_field() ?>
                 <div class="form-group">
                     <label>Application Name</label>
                     <input type="text" name="app_name" value="<?= htmlspecialchars($settings['app_name']) ?>" required>
@@ -238,7 +239,7 @@ $page_title = 'System Settings';
 
         <div class="card">
             <div class="card-title"><i class="fa-solid fa-user-shield"></i> Security Profile</div>
-            <form method="POST">
+            <form method="POST"><?= csrf_field() ?>
                 <div class="form-group">
                     <label>Current Password</label>
                     <input type="password" name="current_password" required placeholder="••••••••••••">

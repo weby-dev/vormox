@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 
 // --- UPDATE PANEL STATUS (Manual Row Change) ---
@@ -68,7 +70,7 @@ $page_title = 'Provisioned Infrastructure';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -279,7 +281,7 @@ $page_title = 'Provisioned Infrastructure';
                             </span>
                         </td>
                         <td>
-                            <form method="POST" action="panels.php" class="inline-form">
+                            <form method="POST" action="panels.php" class="inline-form"><?= csrf_field() ?>
                                 <input type="hidden" name="panel_id" value="<?= htmlspecialchars($p['id']) ?>">
                                 <select name="status" class="status-select" onchange="this.form.submit()" style="padding: 6px 10px;">
                                     <option value="creating" <?= $p['status']=='creating'?'selected':'' ?>>Creating...</option>
@@ -364,16 +366,23 @@ function runBulk(type) {
     const ids = Array.from(checkboxes).map(cb => cb.value);
     let promises = [];
 
+    const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+
     for (const id of ids) {
         const formData = new FormData();
+        formData.append('csrf_token', csrf);
         formData.append('ajax_action', action);
         formData.append('service_type', type);
-        
+
         let row = document.getElementById('row-' + id);
         if(row) row.style.opacity = '0.4';
 
         // Call the AJAX handler for each checked panel
-        let p = fetch(`ajax_service_handler.php?id=${id}`, { method: 'POST', body: formData })
+        let p = fetch(`ajax_service_handler.php?id=${id}`, {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrf },
+            body: formData
+        })
             .then(async res => {
                 if (!res.ok) throw new Error("HTTP error " + res.status);
                 const text = await res.text();

@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 $ticket_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 
@@ -109,7 +111,7 @@ $page_title = 'Ticket #' . $ticket['id'];
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -309,7 +311,7 @@ $page_title = 'Ticket #' . $ticket['id'];
             </div>
 
             <!-- Reply Box -->
-            <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?>" class="reply-box">
+            <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?><?= csrf_field() ?>" class="reply-box">
                 <div style="font-family: var(--font-head); font-weight: 700; margin-bottom: 16px;"><i class="fa-solid fa-reply"></i> Add a Reply</div>
                 <textarea name="message" placeholder="Type your response here... Markdown/HTML is stripped for security." required></textarea>
                 <div style="text-align: right;">
@@ -332,7 +334,7 @@ $page_title = 'Ticket #' . $ticket['id'];
                 </div>
                 
                 <div style="padding: 24px; background: rgba(0,0,0,0.1); border-top: 1px solid var(--border);">
-                    <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?>">
+                    <form method="POST" action="view-ticket.php?id=<?= $ticket_id ?><?= csrf_field() ?>">
                         <label class="meta-label" style="display: block; margin-bottom: 8px;">Change Status</label>
                         <select name="status" class="status-select">
                             <option value="Open" <?= $ticket['status']=='Open'?'selected':'' ?>>Open</option>

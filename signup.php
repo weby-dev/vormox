@@ -11,6 +11,7 @@ require_once 'config.php';
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_require();
     $first_name = trim(filter_input(INPUT_POST, 'first_name', FILTER_SANITIZE_SPECIAL_CHARS));
     $last_name = trim(filter_input(INPUT_POST, 'last_name', FILTER_SANITIZE_SPECIAL_CHARS));
     $email = trim(filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL));
@@ -39,10 +40,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $ip_address = $_SERVER['REMOTE_ADDR'];
 
                 $insertStmt = $pdo->prepare("
-                    INSERT INTO users (first_name, last_name, email, password_hash, theme, last_ip, last_login) 
-                    VALUES (:fn, :ln, :email, :hash, :theme, :ip, NOW())
+                    INSERT INTO users (first_name, last_name, email, password_hash, theme, last_ip, last_login, status)
+                    VALUES (:fn, :ln, :email, :hash, :theme, :ip, NOW(), 'unverified')
                 ");
-                
+
                 $insertStmt->execute([
                     'fn' => $first_name,
                     'ln' => $last_name,
@@ -55,6 +56,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $user_id = $pdo->lastInsertId();
 
                 session_regenerate_id(true);
+                csrf_rotate();
                 $_SESSION['user_id'] = $user_id;
                 $_SESSION['logged_in'] = true;
 
@@ -70,7 +72,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Create Account — Vormox Automation Cloud</title>
@@ -234,7 +236,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     <?php endif; ?>
 
-    <form method="POST" action="signup.php">
+    <form method="POST" action="signup.php"><?= csrf_field() ?>
       <input type="hidden" name="detected_theme" id="detected_theme" value="dark">
       
       <div class="form-row">

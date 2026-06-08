@@ -61,7 +61,55 @@ try {
 } catch (Exception $e) { /* Ignore and use fallback */ }
 
 $inr_amount = number_format($usd_amount * $exchange_rate, 2, '.', '');
-$paytm_order_id = "PTM" . $invoice['id'] . "_" . substr(md5(time()), 0, 8);
+
+// -------------------------------------------------------------
+// PAYTM ORDER BINDING
+// -------------------------------------------------------------
+// The order id and INR amount are issued exactly ONCE per invoice and
+// persisted. From here on, ajax_paytm_status.php ignores anything the
+// client sends and looks these up by invoice_number. That stops the old
+// "pay ₹1 for X, replay that order id against $10K invoice Y" attack.
+if ($invoice['status'] === 'Unpaid' && $gateway && !empty($gateway['paytm_upi_id'])) {
+    if (empty($invoice['paytm_order_id'])) {
+        try {
+            $issued_order_id = 'PTM' . $invoice['id'] . '_' . bin2hex(random_bytes(8));
+            $pdo->prepare("
+                UPDATE invoices
+                   SET paytm_order_id        = ?,
+                       paytm_expected_amount = ?,
+                       paytm_order_issued_at = NOW()
+                 WHERE id = ?
+                   AND status = 'Unpaid'
+                   AND paytm_order_id IS NULL
+            ")->execute([$issued_order_id, $inr_amount, $invoice['id']]);
+
+            // Re-read so we use whatever ended up persisted (handles the rare
+            // race where two tabs both tried to issue at the same time — the
+            // first INSERT wins via the IS NULL guard).
+            $re = $pdo->prepare("
+                SELECT paytm_order_id, paytm_expected_amount
+                  FROM invoices WHERE id = ? LIMIT 1
+            ");
+            $re->execute([$invoice['id']]);
+            if ($row = $re->fetch()) {
+                $invoice['paytm_order_id']        = $row['paytm_order_id'];
+                $invoice['paytm_expected_amount'] = $row['paytm_expected_amount'];
+            }
+        } catch (PDOException $e) {
+            // Surface as a hard failure — without binding we can't safely show
+            // a QR. Fall back to wallet/card flows.
+            error_log("Failed to issue Paytm order for invoice {$invoice['id']}: " . $e->getMessage());
+        }
+    }
+}
+
+// Use the persisted values as the source of truth for the QR + page display.
+$paytm_order_id = $invoice['paytm_order_id'] ?? null;
+if (!empty($invoice['paytm_expected_amount'])) {
+    // Re-format so the rest of the page renders consistent values regardless
+    // of today's exchange rate.
+    $inr_amount = number_format((float) $invoice['paytm_expected_amount'], 2, '.', '');
+}
 
 $is_wallet_topup = (strpos($invoice['invoice_number'], 'WAL-') === 0);
 
@@ -135,7 +183,7 @@ include 'includes/header.php';
             <?php if($invoice['status'] === 'Unpaid'): ?>
                 
                 <?php if(!$is_wallet_topup): ?>
-                <form method="POST" action="wallet_pay.php" style="margin: 0;">
+                <form method="POST" action="wallet_pay.php" style="margin: 0;"><?= csrf_field() ?>
                     <input type="hidden" name="invoice_number" value="<?= htmlspecialchars($invoice['invoice_number']) ?>">
                     <?php if ($invoice['wallet_balance'] >= $usd_amount): ?>
                         <button type="submit" class="btn-action btn-wallet"><i class="fa-solid fa-wallet"></i> Pay via Wallet</button>
@@ -145,12 +193,8 @@ include 'includes/header.php';
                 </form>
                 <?php endif; ?>
 
-                <?php if($gateway && $gateway['paytm_upi_id']): ?>
+                <?php if($gateway && $gateway['paytm_upi_id'] && $paytm_order_id): ?>
                     <button class="btn-action btn-upi" onclick="openUpiModal()"><i class="fa-solid fa-qrcode"></i> Pay via UPI (₹<?= $inr_amount ?>)</button>
-                    <form method="POST" action="paytm_process.php" style="margin: 0;">
-                        <input type="hidden" name="invoice_number" value="<?= htmlspecialchars($invoice['invoice_number']) ?>">
-                        <button type="submit" class="btn-print btn-action" style="background: var(--bg2); border-color: transparent;"><i class="fa-solid fa-credit-card"></i> Card/NetBanking</button>
-                    </form>
                 <?php endif; ?>
 
             <?php endif; ?>
@@ -229,7 +273,7 @@ include 'includes/header.php';
         <h3 style="font-family: var(--font-head); margin-bottom: 8px;">Top Up Wallet</h3>
         <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">Enter the amount of USD you want to add.</p>
         
-        <form method="POST" action="add_funds.php">
+        <form method="POST" action="add_funds.php"><?= csrf_field() ?>
             <input type="number" name="amount" class="input-amount" min="1" max="1000" step="1" placeholder="$10.00" required>
             <div style="display: flex; gap: 8px; margin-top: 16px;">
                 <button type="button" class="btn-print btn-action" onclick="closeAddFundsModal()" style="flex: 1;">Cancel</button>
@@ -239,7 +283,7 @@ include 'includes/header.php';
     </div>
 </div>
 
-<?php if($invoice['status'] === 'Unpaid' && $gateway): ?>
+<?php if($invoice['status'] === 'Unpaid' && $gateway && $paytm_order_id): ?>
 <div class="modal-overlay" id="upiModal">
     <div class="modal-content">
         <h3 style="font-family: var(--font-head); margin-bottom: 8px;">Scan to Pay</h3>
@@ -287,10 +331,14 @@ include 'includes/header.php';
     async function checkPaymentStatus() {
         try {
             const formData = new URLSearchParams();
-            formData.append('order_id', '<?= $paytm_order_id ?>');
+            formData.append('csrf_token', window.CSRF_TOKEN || '');
             formData.append('invoice_number', '<?= $invoice['invoice_number'] ?>');
 
-            const res = await fetch('ajax_paytm_status.php', { method: 'POST', body: formData });
+            const res = await fetch('ajax_paytm_status.php', {
+                method: 'POST',
+                headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+                body: formData
+            });
             const data = await res.json();
 
             if (data.status === 'success') {

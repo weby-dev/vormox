@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $panel_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 if (!$panel_id) { header("Location: panels.php"); exit; }
 
@@ -30,12 +32,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_panel_config']
         $nodes = filter_input(INPUT_POST, 'nodes_count', FILTER_VALIDATE_INT);
         $billing = filter_input(INPUT_POST, 'billing_cycle', FILTER_SANITIZE_SPECIAL_CHARS);
         $status = filter_input(INPUT_POST, 'status', FILTER_SANITIZE_SPECIAL_CHARS);
-        $auto_renew = isset($_POST['auto_renew']) ? 1 : 0;
-        
+        $auto_renew        = isset($_POST['auto_renew']) ? 1 : 0;
+        $bypass_suspension = isset($_POST['bypass_suspension']) ? 1 : 0;
+
         $expiry_date = !empty($_POST['expiry_date']) ? $_POST['expiry_date'] : null;
 
-        $upStmt = $pdo->prepare("UPDATE user_panels SET domain = ?, nodes_count = ?, billing_cycle = ?, status = ?, expiry_date = ?, auto_renew = ? WHERE id = ?");
-        $upStmt->execute([$domain, $nodes, $billing, $status, $expiry_date, $auto_renew, $panel_id]);
+        $upStmt = $pdo->prepare("
+            UPDATE user_panels
+               SET domain = ?, nodes_count = ?, billing_cycle = ?, status = ?,
+                   expiry_date = ?, auto_renew = ?, bypass_suspension = ?
+             WHERE id = ?
+        ");
+        $upStmt->execute([$domain, $nodes, $billing, $status, $expiry_date, $auto_renew, $bypass_suspension, $panel_id]);
 
         // 2. Update panel_details
         $checkPd = $pdo->prepare("SELECT id FROM panel_details WHERE panel_id = ?");
@@ -58,13 +66,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_panel_config']
                 $panel_id
             ]);
         } else {
+            // be_status / fe_status are NOT NULL with no DB default — supply them
+            // on first INSERT or strict mode rejects the row.
             $pdSql = "INSERT INTO panel_details (
                 panel_id, status,
-                be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass,
-                fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass,
+                be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass, be_status,
+                fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass, fe_status,
                 db_server_ip, db_name, db_user, db_pass,
                 rp_service, rp_server_ip, rp_ssh_port, rp_ssh_user, rp_ssh_pass
-            ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            ) VALUES (?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 
             $pdo->prepare($pdSql)->execute([
                 $panel_id,
@@ -116,7 +126,7 @@ $page_title = 'Manage: ' . $panel['domain'];
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -450,8 +460,8 @@ $page_title = 'Manage: ' . $panel['domain'];
             <button class="close-btn" onclick="closeConfigModal()"><i class="fa-solid fa-xmark"></i></button>
         </div>
         <div class="modal-body">
-            <form method="POST" action="manage_panel.php?id=<?= $panel_id ?>">
-                
+            <form method="POST" action="manage_panel.php?id=<?= (int)$panel_id ?>">
+                <?= csrf_field() ?>
                 <div class="form-grid-modal">
                     
                     <div class="form-section">
@@ -486,6 +496,15 @@ $page_title = 'Manage: ' . $panel['domain'];
                         </div>
                         <div class="input-group" style="display: flex; align-items: center; gap: 8px;">
                             <input type="checkbox" name="auto_renew" value="1" <?= $panel['auto_renew'] ? 'checked' : '' ?> style="width: auto;"> <span style="font-size: 13px; font-weight: 500;">Enable Auto-Renew</span>
+                        </div>
+                        <div class="input-group" style="display: flex; align-items: center; gap: 8px;">
+                            <input type="checkbox" name="bypass_suspension" value="1" <?= !empty($panel['bypass_suspension']) ? 'checked' : '' ?> style="width: auto;">
+                            <span style="font-size: 13px; font-weight: 500;">
+                                Bypass Automatic Suspension
+                                <span style="display: block; font-size: 11px; color: var(--text-muted); font-weight: 400; margin-top: 2px;">
+                                    Exempt this panel from any automated suspension job (overdue invoices, expired plan, etc). Admin can still suspend manually via the Status dropdown.
+                                </span>
+                            </span>
                         </div>
                     </div>
 
@@ -605,10 +624,15 @@ function confirmTermination() {
     btn.disabled = true;
 
     const formData = new FormData();
+    formData.append('csrf_token', (document.querySelector('meta[name="csrf-token"]')||{}).content || '');
     formData.append('ajax_action', 'terminate');
     formData.append('service_type', 'all');
 
-    fetch(`ajax_service_handler.php?id=${panelId}`, { method: 'POST', body: formData })
+    fetch(`ajax_service_handler.php?id=${panelId}`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': (document.querySelector('meta[name="csrf-token"]')||{}).content || '' },
+        body: formData
+    })
         .then(async res => {
             if (!res.ok) throw new Error("HTTP error " + res.status);
             return await res.json();
@@ -647,10 +671,15 @@ function runAction(action, type, btn) {
     btn.disabled = true;
 
     const formData = new FormData();
+    formData.append('csrf_token', (document.querySelector('meta[name="csrf-token"]')||{}).content || '');
     formData.append('ajax_action', action);
     formData.append('service_type', type);
 
-    fetch(`ajax_service_handler.php?id=${panelId}`, { method: 'POST', body: formData })
+    fetch(`ajax_service_handler.php?id=${panelId}`, {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': (document.querySelector('meta[name="csrf-token"]')||{}).content || '' },
+        body: formData
+    })
         .then(async res => {
             if (!res.ok) throw new Error("HTTP error " + res.status);
             const text = await res.text();
@@ -699,27 +728,77 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     let pollInterval;
-    const logSource = document.getElementById('logSource');
-    const logOutput = document.getElementById('logOutput');
-    const terminalBody = document.getElementById('terminalBody');
+    let logInFlight = false;
+    let logFailures = 0;
+    const LOG_MAX_FAILURES   = 3;
+    const LOG_FETCH_TIMEOUT  = 12000; // 12s — caps blocked SSH calls so polling doesn't pile up
+
+    const logSource     = document.getElementById('logSource');
+    const logOutput     = document.getElementById('logOutput');
+    const terminalBody  = document.getElementById('terminalBody');
     const liveIndicator = document.getElementById('liveIndicator');
+
+    function stopLogStream(reason) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+        liveIndicator.style.display = 'none';
+        logOutput.textContent =
+            `[!] Log stream stopped after ${logFailures} consecutive errors.\n` +
+            `[!] Last error: ${reason}\n\n` +
+            `Possible causes:\n` +
+            `  • SSH host is on a private network the web server can't reach\n` +
+            `  • SSH credentials are wrong (user/pass mismatch)\n` +
+            `  • The target systemd service or log file does not exist\n` +
+            `  • Firewall blocks port 22 between this host and the target\n\n` +
+            `Re-select a log source to retry.`;
+    }
 
     function fetchLogs() {
         const type = logSource.value;
         if (!type) return;
 
-        fetch(`ajax_service_handler.php?id=${panelId}&ajax=logs&type=${type}`)
-            .then(res => res.json())
+        // Don't pile up — if the previous request is still pending, skip this tick.
+        if (logInFlight) return;
+        logInFlight = true;
+
+        const controller = new AbortController();
+        const timeoutId  = setTimeout(() => controller.abort(), LOG_FETCH_TIMEOUT);
+
+        fetch(`ajax_service_handler.php?id=${panelId}&ajax=logs&type=${encodeURIComponent(type)}`, {
+            signal: controller.signal
+        })
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
             .then(data => {
-                if (data.log) {
+                logFailures = 0;
+                if (data.log !== undefined) {
                     logOutput.textContent = data.log;
                     terminalBody.scrollTop = terminalBody.scrollHeight;
                 }
-            }).catch(() => {});
+            })
+            .catch(err => {
+                logFailures++;
+                const reason = err.name === 'AbortError'
+                    ? `request timed out after ${LOG_FETCH_TIMEOUT / 1000}s`
+                    : (err.message || 'fetch failed');
+                if (logFailures >= LOG_MAX_FAILURES) {
+                    stopLogStream(reason);
+                }
+            })
+            .finally(() => {
+                clearTimeout(timeoutId);
+                logInFlight = false;
+            });
     }
 
     logSource.addEventListener('change', (e) => {
         clearInterval(pollInterval);
+        pollInterval = null;
+        logInFlight  = false;
+        logFailures  = 0;
+
         if (e.target.value === "") {
             logOutput.textContent = "Connection closed.";
             liveIndicator.style.display = 'none';

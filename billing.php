@@ -8,49 +8,17 @@ if (!isset($_SESSION['user_id']) || $_SESSION['logged_in'] !== true) {
 
 require_once 'config.php';
 
-// Handle Add Funds AJAX Request
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add_funds_success') {
-    $amount = filter_input(INPUT_POST, 'amount', FILTER_VALIDATE_FLOAT);
-    $order_id = filter_input(INPUT_POST, 'order_id', FILTER_SANITIZE_SPECIAL_CHARS);
-
-    if ($amount > 0 && $order_id) {
-        try {
-            $pdo->beginTransaction();
-
-            // 1. Update the user's wallet balance
-            $stmt = $pdo->prepare("UPDATE users SET wallet_balance = wallet_balance + :amount WHERE id = :uid");
-            $stmt->execute(['amount' => $amount, 'uid' => $_SESSION['user_id']]);
-
-            // 2. Generate a "Paid" invoice for this Add Funds transaction
-            $invoice_number = 'INV-FND-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
-            
-            $invStmt = $pdo->prepare("
-                INSERT INTO invoices (user_id, invoice_number, amount, status, due_date, created_at, updated_at) 
-                VALUES (:uid, :inv_num, :amount, 'Paid', NOW(), NOW(), NOW())
-            ");
-            $invStmt->execute([
-                'uid' => $_SESSION['user_id'],
-                'inv_num' => $invoice_number,
-                'amount' => $amount
-            ]);
-
-            $pdo->commit();
-            echo json_encode(['success' => true]);
-            
-        } catch (PDOException $e) {
-            $pdo->rollBack();
-            error_log("Failed to add funds and create invoice: " . $e->getMessage());
-            echo json_encode(['success' => false, 'error' => 'Database transaction failed']);
-        }
-        exit;
-    }
-}
+// NOTE: The old `add_funds_success` AJAX endpoint was removed — it credited the
+// wallet from client-supplied amounts with no payment verification, which let
+// any logged-in user mint balance. Funds are now added through add_funds.php,
+// which creates a WAL- invoice that is verified via ajax_paytm_status.php.
 
 $error = '';
 $success = '';
 
 // Handle Billing Profile Update
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_billing'])) {
+    csrf_require();
     $billing_type = $_POST['billing_type'] === 'company' ? 'company' : 'individual';
     $company_name = $billing_type === 'company' ? trim(filter_input(INPUT_POST, 'company_name', FILTER_SANITIZE_SPECIAL_CHARS)) : null;
     $tax_id = $billing_type === 'company' ? trim(filter_input(INPUT_POST, 'tax_id', FILTER_SANITIZE_SPECIAL_CHARS)) : null;
@@ -138,19 +106,6 @@ try {
         ];
     }
 
-    $gwStmt = $pdo->prepare("SELECT * FROM payment_gateways WHERE status = 'active'");
-    $gwStmt->execute();
-    $gateways = $gwStmt->fetchAll();
-
-    $paytmConfig = ['merchantId' => '', 'upiId' => '', 'environment' => 'production'];
-    foreach ($gateways as $gw) {
-        if ($gw['type'] === 'paytm') {
-            $paytmConfig['merchantId'] = $gw['paytm_merchant_id'];
-            $paytmConfig['upiId'] = $gw['paytm_upi_id'];
-            $paytmConfig['environment'] = $gw['environment'];
-        }
-    }
-
 } catch (PDOException $e) {
     die("A system error occurred.");
 }
@@ -160,8 +115,6 @@ $header_title = 'Billing & Payments';
 
 include 'includes/header.php';
 ?>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 
 <style>
     .page-header { margin-bottom: 32px; }
@@ -252,8 +205,7 @@ include 'includes/header.php';
     <div class="billing-grid">
         
         <div class="card">
-            <form method="POST" action="billing.php">
-                
+            <form method="POST" action="billing.php"><?= csrf_field() ?>
                 <div class="segmented-control">
                     <input type="radio" name="billing_type" id="type_individual" value="individual" <?= $billing['billing_type'] === 'individual' ? 'checked' : '' ?>>
                     <label for="type_individual"><i class="fa-solid fa-user" style="margin-right: 8px;"></i> Individual / Personal</label>
@@ -266,11 +218,11 @@ include 'includes/header.php';
                     <div class="form-row">
                         <div class="form-group">
                             <label class="field-label" for="company_name">Company Name *</label>
-                            <input type="text" id="company_name" name="company_name" value="<?= htmlspecialchars($billing['company_name']) ?>" placeholder="e.g., Vormox LLC">
+                            <input type="text" id="company_name" name="company_name" value="<?= htmlspecialchars($billing['company_name'] ?? '') ?>" placeholder="e.g., Vormox LLC">
                         </div>
                         <div class="form-group">
                             <label class="field-label" for="tax_id">Tax ID / VAT Number</label>
-                            <input type="text" id="tax_id" name="tax_id" value="<?= htmlspecialchars($billing['tax_id']) ?>" placeholder="Optional">
+                            <input type="text" id="tax_id" name="tax_id" value="<?= htmlspecialchars($billing['tax_id'] ?? '') ?>" placeholder="Optional">
                         </div>
                     </div>
                 </div>
@@ -288,7 +240,7 @@ include 'includes/header.php';
 
                 <div class="form-group">
                     <label class="field-label" for="address_line2">Address Line 2</label>
-                    <input type="text" id="address_line2" name="address_line2" value="<?= htmlspecialchars($billing['address_line2']) ?>" placeholder="Apartment, suite, unit, etc. (optional)">
+                    <input type="text" id="address_line2" name="address_line2" value="<?= htmlspecialchars($billing['address_line2'] ?? '') ?>" placeholder="Apartment, suite, unit, etc. (optional)">
                 </div>
 
                 <div class="form-row">
@@ -348,36 +300,24 @@ include 'includes/header.php';
             <div class="modal-title">Add Funds</div>
             <button id="closeFundsModalBtn" class="btn-close"><i class="fa-solid fa-xmark"></i></button>
         </div>
-        
-        <div id="fundsFormContainer">
+
+        <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 20px;">
+            Enter the amount you'd like to add. We'll generate an invoice you can pay with UPI.
+        </p>
+
+        <form method="POST" action="add_funds.php"><?= csrf_field() ?>
             <div class="form-group">
-                <label class="field-label" for="fund_amount">Amount ($ USD)</label>
-                <input type="number" id="fund_amount" min="1" step="0.01" required placeholder="10.00">
-            </div>
-            
-            <div class="form-group">
-                <label class="field-label" for="payment_gateway">Select Payment Gateway</label>
-                <div class="select-wrapper">
-                    <select id="payment_gateway">
-                        <?php foreach ($gateways as $gw): ?>
-                            <option value="<?= htmlspecialchars($gw['type']) ?>"><?= htmlspecialchars($gw['name']) ?></option>
-                        <?php endforeach; ?>
-                    </select>
-                </div>
+                <label class="field-label" for="fund_amount">Amount (USD)</label>
+                <input type="number" id="fund_amount" name="amount" min="1" max="5000" step="1" required placeholder="10.00" autofocus>
             </div>
 
-            <div style="margin-top: 32px; display: flex; justify-content: flex-end;">
-                <button id="proceedPayBtn" class="btn-primary" style="width: 100%;">Proceed to Pay</button>
+            <div style="margin-top: 24px; display: flex; gap: 12px;">
+                <button type="button" id="closeFundsCancelBtn" class="btn-print btn-action" style="flex: 1; padding: 12px; background: transparent; color: var(--text-muted); border: 1px solid var(--border); border-radius: 8px; font-weight: 600; cursor: pointer;">Cancel</button>
+                <button type="submit" class="btn-primary" style="flex: 1; padding: 12px; border: none; border-radius: 8px; cursor: pointer;">
+                    <i class="fa-solid fa-file-invoice-dollar"></i> Generate Invoice
+                </button>
             </div>
-        </div>
-
-        <div id="qrContainer" class="qr-container">
-            <p style="color: var(--text-muted); margin-bottom: 16px; font-size: 14px;">Scan the QR code with any UPI app to pay</p>
-            <div id="qrCode"></div>
-            <div id="paymentStatus" class="payment-status status-pending">
-                <span class="spinner"></span> Waiting for payment...
-            </div>
-        </div>
+        </form>
     </div>
 </div>
 
@@ -401,168 +341,35 @@ document.addEventListener('DOMContentLoaded', () => {
     if(radioIndividual) radioIndividual.addEventListener('change', toggleCompanyFields);
     if(radioCompany) radioCompany.addEventListener('change', toggleCompanyFields);
 
-    const addFundsBtn = document.getElementById('addFundsBtn');
-    const fundsModal = document.getElementById('addFundsModal');
+    // --- Add Funds modal: just opens, submits to add_funds.php ---
+    const addFundsBtn        = document.getElementById('addFundsBtn');
+    const fundsModal         = document.getElementById('addFundsModal');
     const closeFundsModalBtn = document.getElementById('closeFundsModalBtn');
-    const proceedPayBtn = document.getElementById('proceedPayBtn');
-    const fundsFormContainer = document.getElementById('fundsFormContainer');
-    const qrContainer = document.getElementById('qrContainer');
-    const paymentStatus = document.getElementById('paymentStatus');
-    
-    let checkStatusInterval;
-    const paytmConfig = {
-        merchantId: "<?= $paytmConfig['merchantId'] ?? '' ?>",
-        upiId: "<?= $paytmConfig['upiId'] ?? '' ?>",
-        environment: "<?= $paytmConfig['environment'] ?? 'production' ?>",
-        userId: "<?= $_SESSION['user_id'] ?>"
-    };
+    const closeFundsCancelBtn = document.getElementById('closeFundsCancelBtn');
 
-    function resetModal() {
-        if(!fundsFormContainer) return;
-        fundsFormContainer.style.display = 'block';
-        qrContainer.classList.remove('active');
-        document.getElementById('qrCode').innerHTML = '';
-        document.getElementById('fund_amount').value = '';
-        
-        const oldLabel = qrContainer.querySelector('.rate-label');
-        if (oldLabel) oldLabel.remove();
-        
-        proceedPayBtn.disabled = false;
-        proceedPayBtn.innerHTML = 'Proceed to Pay';
-        
-        if(checkStatusInterval) clearInterval(checkStatusInterval);
+    function openFundsModal() {
+        if (!fundsModal) return;
+        const amt = document.getElementById('fund_amount');
+        if (amt) amt.value = '';
+        fundsModal.classList.add('active');
+        setTimeout(() => amt && amt.focus(), 50);
+    }
+    function closeFundsModal() {
+        if (fundsModal) fundsModal.classList.remove('active');
     }
 
-    if(addFundsBtn) {
-        addFundsBtn.addEventListener('click', () => {
-            resetModal();
-            fundsModal.classList.add('active');
-        });
-    }
+    if (addFundsBtn)         addFundsBtn.addEventListener('click', openFundsModal);
+    if (closeFundsModalBtn)  closeFundsModalBtn.addEventListener('click', closeFundsModal);
+    if (closeFundsCancelBtn) closeFundsCancelBtn.addEventListener('click', closeFundsModal);
+    if (fundsModal)          fundsModal.addEventListener('click', (e) => { if (e.target === fundsModal) closeFundsModal(); });
 
-    if(closeFundsModalBtn) {
-        closeFundsModalBtn.addEventListener('click', () => {
-            fundsModal.classList.remove('active');
-            if(checkStatusInterval) clearInterval(checkStatusInterval);
-        });
-    }
-
-    if(proceedPayBtn) {
-        proceedPayBtn.addEventListener('click', async () => {
-            const usdAmount = parseFloat(document.getElementById('fund_amount').value);
-            const gateway = document.getElementById('payment_gateway').value;
-
-            if (!usdAmount || usdAmount <= 0) {
-                alert('Please enter a valid amount');
-                return;
-            }
-
-            if (gateway === 'paytm') {
-                proceedPayBtn.disabled = true;
-                proceedPayBtn.innerHTML = '<span class="spinner"></span> Converting USD to INR...';
-
-                try {
-                    const response = await fetch('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json');
-                    const data = await response.json();
-                    
-                    const conversionRate = data.usd.inr;
-                    const inrAmount = (usdAmount * conversionRate).toFixed(2);
-
-                    fundsFormContainer.style.display = 'none';
-                    qrContainer.classList.add('active');
-
-                    const rateLabel = document.createElement('div');
-                    rateLabel.className = 'rate-label';
-                    rateLabel.innerHTML = `<div style="background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.2); color: var(--accent-green); padding: 12px; border-radius: 8px; margin-bottom: 20px; font-weight: 600; font-family: var(--font-mono); font-size: 13px;">$${usdAmount.toFixed(2)} USD = ₹${inrAmount} INR <span style="display:block; font-size: 10px; opacity: 0.8; margin-top: 4px;">Live Rate: 1 USD = ₹${conversionRate.toFixed(2)}</span></div>`;
-                    qrContainer.insertBefore(rateLabel, qrContainer.firstChild);
-
-                    const orderId = "PTM_WALLET_" + paytmConfig.userId + "_" + Math.floor(Date.now() / 1000);
-                    
-                    const upiUrl = `upi://pay?pa=${encodeURIComponent(paytmConfig.upiId)}&pn=Vormox&am=${inrAmount}&cu=INR&tn=Add Funds&tr=${orderId}`;
-                    
-                    new QRCode(document.getElementById("qrCode"), {
-                        text: upiUrl,
-                        width: 200,
-                        height: 200,
-                        colorDark: "#000000",
-                        colorLight: "#ffffff",
-                        correctLevel: QRCode.CorrectLevel.H
-                    });
-
-                    // Pass USD amount to polling so the wallet + invoice get credited exactly in Dollars
-                    startPaymentPolling(orderId, usdAmount);
-
-                } catch (error) {
-                    alert('Failed to fetch the live exchange rate. Please try again.');
-                    proceedPayBtn.disabled = false;
-                    proceedPayBtn.innerHTML = 'Proceed to Pay';
-                }
-            } else {
-                alert('This gateway integration is pending.');
-            }
-        });
-    }
-
-    function startPaymentPolling(orderId, usdAmount) {
-        paymentStatus.className = 'payment-status status-pending';
-        paymentStatus.innerHTML = '<span class="spinner"></span> Waiting for payment...';
-
-        checkStatusInterval = setInterval(async () => {
-            try {
-                const apiUrl = paytmConfig.environment === "production" 
-                    ? "https://securegw.paytm.in/order/status" 
-                    : "https://securegw-stage.paytm.in/order/status";
-                
-                const response = await fetch(apiUrl, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        "MID": paytmConfig.merchantId,
-                        "ORDERID": orderId
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.STATUS === "TXN_SUCCESS") {
-                    clearInterval(checkStatusInterval);
-                    paymentStatus.className = 'payment-status status-success';
-                    paymentStatus.innerHTML = '<i class="fa-solid fa-check"></i> Payment Successful!';
-                    
-                    const formData = new URLSearchParams();
-                    formData.append('action', 'add_funds_success');
-                    formData.append('amount', usdAmount);
-                    formData.append('order_id', orderId);
-
-                    await fetch('billing.php', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    setTimeout(() => {
-                        // Redirect to invoices so the user can immediately see their new "Paid" invoice receipt
-                        window.location.href = 'invoices.php';
-                    }, 1500);
-                } else if (data.STATUS === "TXN_FAILURE" && !data.RESPMSG.includes("Invalid Order Id")) {
-                    clearInterval(checkStatusInterval);
-                    paymentStatus.className = 'payment-status status-error';
-                    paymentStatus.innerHTML = '<i class="fa-solid fa-xmark"></i> Payment Failed';
-                }
-            } catch (error) {
-                // Keep polling silently
-            }
-        }, 3000);
-    }
-
+    // Allow ?action=add_funds deep-link to auto-open the modal
     const urlParams = new URLSearchParams(window.location.search);
     if (urlParams.get('action') === 'add_funds') {
         setTimeout(() => {
-            if(fundsModal && addFundsBtn) {
-                resetModal();
-                fundsModal.classList.add('active');
-                window.history.replaceState({}, document.title, "billing.php");
-            }
-        }, 100);
+            openFundsModal();
+            window.history.replaceState({}, document.title, 'billing.php');
+        }, 50);
     }
 });
 </script>

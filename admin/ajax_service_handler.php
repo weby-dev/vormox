@@ -42,24 +42,53 @@ try {
 // ==========================================
 // 3. SSH EXECUTION ENGINE
 // ==========================================
-function execute_ssh_command($ip, $port, $user, $pass, $command) {
+function execute_ssh_command($ip, $port, $user, $pass, $command, $timeout = 5) {
     if (!function_exists('ssh2_connect')) {
         return ['success' => false, 'output' => "Error: PHP ssh2 extension missing on web server."];
     }
-    
-    $connection = @ssh2_connect($ip, $port ?: 22);
-    if (!$connection) return ['success' => false, 'output' => "SSH Connection failed to $ip:$port"];
-    
-    if (!@ssh2_auth_password($connection, $user, $pass)) {
-        return ['success' => false, 'output' => "SSH Authentication failed for user '$user'."];
+    $port = (int) ($port ?: 22);
+
+    // PRE-CHECK: is the host reachable on the SSH port? A private-network IP
+    // that doesn't route from the web server makes ssh2_connect() block for
+    // 60+ seconds. With JS polling every 4s, workers stack up and the site
+    // becomes unresponsive. Fail fast at the TCP layer instead.
+    $errno = 0; $errstr = '';
+    $sock = @stream_socket_client(
+        "tcp://{$ip}:{$port}",
+        $errno, $errstr,
+        $timeout
+    );
+    if (!$sock) {
+        return ['success' => false, 'output' => "SSH host unreachable: {$ip}:{$port} ({$errstr})"];
     }
-    
-    $stream = ssh2_exec($connection, $command);
-    if (!$stream) return ['success' => false, 'output' => "Command execution failed."];
-    
+    fclose($sock);
+
+    $connection = @ssh2_connect($ip, $port);
+    if (!$connection) return ['success' => false, 'output' => "SSH handshake failed to {$ip}:{$port}"];
+
+    if (!@ssh2_auth_password($connection, $user, $pass)) {
+        return ['success' => false, 'output' => "SSH authentication failed for '{$user}'."];
+    }
+
+    $stream = @ssh2_exec($connection, $command);
+    if (!$stream) return ['success' => false, 'output' => "SSH command execution failed."];
+
+    // Cap the read so a runaway command can't pin the worker indefinitely.
     stream_set_blocking($stream, true);
-    $output = stream_get_contents(ssh2_fetch_stream($stream, SSH2_STREAM_STDIO));
-    return ['success' => true, 'output' => $output];
+    stream_set_timeout($stream, $timeout * 2);
+
+    $stdio = @ssh2_fetch_stream($stream, SSH2_STREAM_STDIO);
+    if (!$stdio) {
+        return ['success' => false, 'output' => "SSH stream open failed."];
+    }
+    stream_set_blocking($stdio, true);
+    stream_set_timeout($stdio, $timeout * 2);
+
+    $output = @stream_get_contents($stdio);
+    @fclose($stdio);
+    @fclose($stream);
+
+    return ['success' => true, 'output' => $output !== false ? $output : ''];
 }
 
 
@@ -67,6 +96,7 @@ function execute_ssh_command($ip, $port, $user, $pass, $command) {
 // 4. ACTION DISPATCHER (POST)
 // ==========================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action'])) {
+    csrf_require();
     $action = filter_input(INPUT_POST, 'ajax_action', FILTER_SANITIZE_SPECIAL_CHARS);
     $type = filter_input(INPUT_POST, 'service_type', FILTER_SANITIZE_SPECIAL_CHARS); 
 
@@ -226,21 +256,43 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'logs') {
         }
 
     // ---------------------------------------------------------
-    // BACKEND & FRONTEND SYSTEMD LOGS
+    // BACKEND & FRONTEND SYSTEMD LOGS  +  BACKEND BUILD/TASK LOG
     // ---------------------------------------------------------
     } else {
-        $ip = ($type === 'be') ? $panel['be_server_ip'] : $panel['fe_server_ip'];
-        $port = ($type === 'be') ? $panel['be_ssh_port'] : $panel['fe_ssh_port'];
-        $user = ($type === 'be') ? $panel['be_ssh_user'] : $panel['fe_ssh_user'];
-        $pass = ($type === 'be') ? $panel['be_ssh_pass'] : $panel['fe_ssh_pass'];
-        $service = ($type === 'be') ? $panel['be_service'] : $panel['fe_service'];
-
-        if (empty($ip) || empty($user) || empty($service)) {
-            echo json_encode(['log' => "Configuration error: Missing credentials or service name."]); exit;
+        // Map dropdown type → which side's SSH credentials to use.
+        // The old ternary $type === 'be' ? be : fe silently routed `be_task`
+        // (Backend Build & Task Progress) to the FRONTEND side because the
+        // string wasn't exactly 'be'. That's why backend selections were
+        // showing frontend logs.
+        $side = null;
+        if ($type === 'be' || $type === 'be_task') { $side = 'be'; }
+        elseif ($type === 'fe')                    { $side = 'fe'; }
+        else {
+            echo json_encode(['log' => "Unknown log source: " . htmlspecialchars((string)$type)]); exit;
         }
 
-        // Use journalctl for systemd services
-        $cmd = "sudo journalctl -u " . escapeshellarg($service) . " -n 100 --no-pager";
+        $ip      = $panel["{$side}_server_ip"];
+        $port    = $panel["{$side}_ssh_port"];
+        $user    = $panel["{$side}_ssh_user"];
+        $pass    = $panel["{$side}_ssh_pass"];
+        $service = $panel["{$side}_service"];
+
+        if (empty($ip) || empty($user)) {
+            echo json_encode(['log' => "Configuration error: Missing SSH credentials for " . strtoupper($side) . " server."]); exit;
+        }
+
+        if ($type === 'be_task') {
+            // Per-domain build/task log. Adjust path here if your deploy
+            // scripts write to a different location.
+            $task_log = escapeshellarg('/var/log/vormox/' . $panel['domain'] . '-task.log');
+            $cmd = "sudo tail -n 100 {$task_log} 2>/dev/null || echo 'No task log yet for {$panel['domain']}.'";
+        } else {
+            if (empty($service)) {
+                echo json_encode(['log' => "Configuration error: Missing service name for " . strtoupper($side) . "."]); exit;
+            }
+            // systemd journalctl for the long-running daemon
+            $cmd = "sudo journalctl -u " . escapeshellarg($service) . " -n 100 --no-pager";
+        }
     }
 
     // Execute the appropriate SSH command

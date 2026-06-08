@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 $valid_statuses = ['active', 'banned', 'unverified'];
 
@@ -110,7 +112,7 @@ $page_title = 'Client Directory';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -351,7 +353,7 @@ $page_title = 'Client Directory';
                         </td>
                         <td style="text-align: right;">
                             <div style="display: flex; justify-content: flex-end; align-items: center; gap: 8px;">
-                                <form method="POST" action="users.php" style="margin: 0;">
+                                <form method="POST" action="users.php" style="margin: 0;"><?= csrf_field() ?>
                                     <input type="hidden" name="user_id" value="<?= htmlspecialchars($u['id']) ?>">
                                     <select name="status" class="status-select" onchange="this.form.submit()">
                                         <option value="active" <?= ($u['status'] ?? '') == 'active' ? 'selected' : '' ?>>Active</option>

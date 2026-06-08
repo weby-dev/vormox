@@ -1,6 +1,8 @@
 <?php
 session_start();
-require_once '../config.php'; 
+require_once '../config.php';
+require_once '../includes/notifications.php';
+require_once '../includes/pricing.php';
 
 // --- SECURITY BOILERPLATE ---
 $user_ip = $_SERVER['REMOTE_ADDR'];
@@ -15,6 +17,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 $active_tab = 'settings'; // Default tab
 $user_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
@@ -139,13 +143,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_generate_invoice
                     
                     // UPDATED: Now inserting with type = 'renew'
                     $invStmt = $pdo->prepare("
-                        INSERT INTO invoices (user_id, panel_id, invoice_number, amount, type, status, due_date, period_start, period_end, created_at) 
+                        INSERT INTO invoices (user_id, panel_id, invoice_number, amount, type, status, due_date, period_start, period_end, created_at)
                         VALUES (?, ?, ?, ?, 'renew', 'Unpaid', ?, ?, ?, NOW())
                     ");
                     $invStmt->execute([
                         $panel['user_id'], $pid, $invoice_num, $amount, $due_date, $period_start, $period_end
                     ]);
                     $generated++;
+
+                    // Notify the customer that a renewal invoice was issued for them.
+                    try {
+                        $u = $pdo->prepare("
+                            SELECT u.email, u.first_name, p.domain
+                              FROM users u
+                              JOIN user_panels p ON p.id = ?
+                             WHERE u.id = ? LIMIT 1
+                        ");
+                        $u->execute([$pid, $panel['user_id']]);
+                        if ($row = $u->fetch()) {
+                            notify_invoice_created(
+                                $row['email'],
+                                $row['first_name'],
+                                $invoice_num,
+                                $amount,
+                                $due_date,
+                                "Renewal invoice for <strong>" . htmlspecialchars($row['domain'], ENT_QUOTES) . "</strong> covering " . date('M j, Y', strtotime($period_start)) . " — " . date('M j, Y', strtotime($period_end)) . "."
+                            );
+                        }
+                    } catch (PDOException $e) { error_log("Renewal email lookup failed: " . $e->getMessage()); }
                 }
             }
             $pdo->commit();
@@ -179,37 +204,82 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_update_invoices'
             foreach ($selected_invoices as $inv_id) {
                 $pdo->beginTransaction();
                 
-                // IF MARKING AS PAID -> EXTEND PANEL EXPIRY
+                $was_expired_renewal  = false;
+                $new_expiry_for_email = null;
+                $emailTarget          = null;
+
+                // IF MARKING AS PAID -> CREDIT WALLET (top-up), UPGRADE PLAN, or EXTEND PANEL (renewal)
                 if ($new_status === 'Paid') {
                     $chkStmt = $pdo->prepare("
-                        SELECT i.status, i.panel_id, p.billing_cycle, p.expiry_date 
-                        FROM invoices i 
-                        LEFT JOIN user_panels p ON i.panel_id = p.id 
+                        SELECT i.status, i.panel_id, i.type, i.amount, i.user_id, i.invoice_number,
+                               u.email AS user_email, u.first_name AS user_first_name,
+                               p.billing_cycle, p.expiry_date, p.pending_nodes_count, p.domain AS panel_domain
+                        FROM invoices i
+                        JOIN users u       ON u.id = i.user_id
+                        LEFT JOIN user_panels p ON i.panel_id = p.id
                         WHERE i.id = ?
                     ");
                     $chkStmt->execute([$inv_id]);
                     $invData = $chkStmt->fetch();
-                    
-                    if ($invData && $invData['status'] !== 'Paid' && !empty($invData['panel_id'])) {
-                        $cycle = $invData['billing_cycle'] ?? 'monthly';
-                        $current_expiry = $invData['expiry_date'];
-                        
-                        $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
-                        
-                        $months_to_add = 1;
-                        if ($cycle === 'quarterly') $months_to_add = 3;
-                        if ($cycle === 'semi_annually') $months_to_add = 6;
-                        if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
-                        
-                        $new_expiry = date('Y-m-d H:i:s', strtotime("+$months_to_add months", $base_time));
-                        
-                        $pdo->prepare("UPDATE user_panels SET expiry_date = ?, status = 'active' WHERE id = ?")->execute([$new_expiry, $invData['panel_id']]);
+
+                    if ($invData && $invData['status'] !== 'Paid') {
+
+                        $is_upgrade = (strpos($invData['invoice_number'] ?? '', 'UPG-') === 0);
+
+                        // ROUTE A: Wallet Top-Up
+                        if ($invData['type'] === 'topup' || strpos($invData['invoice_number'] ?? '', 'WAL-') === 0) {
+                            $pdo->prepare("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?")
+                                ->execute([$invData['amount'], $invData['user_id']]);
+                        }
+                        // ROUTE B: Plan Upgrade — bump nodes_count, refresh total_price, DON'T extend expiry
+                        elseif ($is_upgrade && !empty($invData['panel_id']) && !empty($invData['pending_nodes_count'])) {
+                            vormox_apply_panel_upgrade(
+                                $pdo,
+                                $invData['panel_id'],
+                                $invData['pending_nodes_count'],
+                                $invData['billing_cycle']
+                            );
+                        }
+                        // ROUTE C: Infrastructure Order/Renew
+                        elseif (!empty($invData['panel_id'])) {
+                            $was_expired_renewal = (
+                                !empty($invData['expiry_date'])
+                                && strtotime($invData['expiry_date']) < time()
+                            );
+
+                            $new_expiry_for_email = vormox_apply_panel_renewal(
+                                $pdo,
+                                $invData['panel_id'],
+                                $invData['billing_cycle'] ?? 'monthly',
+                                $invData['expiry_date']
+                            );
+                            $emailTarget = $invData;
+                        }
                     }
                 }
-                
+
                 $pdo->prepare("UPDATE invoices SET status = ? WHERE id = ?")->execute([$new_status, $inv_id]);
                 $pdo->commit();
                 $processed++;
+
+                // Payment receipt for any invoice that just flipped Paid.
+                if ($new_status === 'Paid' && !empty($invData) && $invData['status'] !== 'Paid') {
+                    notify_invoice_paid(
+                        $invData['user_email'] ?? null,
+                        $invData['user_first_name'] ?? null,
+                        $invData['invoice_number'],
+                        $invData['amount'],
+                        "Payment confirmed by Vormox billing team."
+                    );
+                }
+                if ($was_expired_renewal && $new_expiry_for_email && $emailTarget) {
+                    notify_panel_renewed_after_expiry(
+                        $emailTarget['user_email'],
+                        $emailTarget['user_first_name'],
+                        $emailTarget['panel_domain'],
+                        $new_expiry_for_email
+                    );
+                }
             }
             $success = "Successfully updated $processed invoice(s). Time extensions applied to active panels.";
         } catch (PDOException $e) {
@@ -267,7 +337,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -457,7 +527,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-settings" class="tab-pane <?= $active_tab == 'settings' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
             
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-user" style="color: var(--accent); margin-right: 8px;"></i> Core Account Settings</div>
@@ -568,7 +638,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-panels" class="tab-pane <?= $active_tab == 'panels' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-server" style="color: var(--accent); margin-right: 8px;"></i> Client Infrastructure</div>
                 <div>
@@ -627,7 +697,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-invoices" class="tab-pane <?= $active_tab == 'invoices' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent-green); margin-right: 8px;"></i> Billing History</div>
                 <div style="display: flex; align-items: center;">

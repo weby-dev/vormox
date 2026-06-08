@@ -1,6 +1,8 @@
 <?php
 session_start();
-require_once '../config.php'; 
+require_once '../config.php';
+require_once '../includes/notifications.php';
+require_once '../includes/pricing.php';
 
 // --- SECURITY BOILERPLATE ---
 $user_ip = $_SERVER['REMOTE_ADDR'];
@@ -15,6 +17,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 $invoice_number = filter_input(INPUT_GET, 'id', FILTER_SANITIZE_SPECIAL_CHARS);
 
@@ -29,48 +33,85 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_invoice'])) {
         try {
             $pdo->beginTransaction();
             
-            // Fetch current invoice state
+            // Fetch current invoice state — including user contact + domain
+            // so we can fire a "service restored" mail on after-expiry renewal,
+            // and pending_nodes_count so we can apply plan upgrades.
             $chkStmt = $pdo->prepare("
-                SELECT i.id, i.status, i.type, i.amount, i.user_id, i.panel_id, p.billing_cycle, p.expiry_date 
-                FROM invoices i 
-                LEFT JOIN user_panels p ON i.panel_id = p.id 
+                SELECT i.id, i.status, i.type, i.amount, i.user_id, i.panel_id,
+                       u.email AS user_email, u.first_name AS user_first_name,
+                       p.billing_cycle, p.expiry_date, p.pending_nodes_count, p.domain AS panel_domain
+                FROM invoices i
+                JOIN users u       ON u.id = i.user_id
+                LEFT JOIN user_panels p ON i.panel_id = p.id
                 WHERE i.invoice_number = ? LIMIT 1
             ");
             $chkStmt->execute([$invoice_number]);
             $invData = $chkStmt->fetch();
-            
+
+            $was_expired_renewal  = false;
+            $new_expiry_for_email = null;
+
             if ($invData) {
+                $is_upgrade = (strpos($invoice_number, 'UPG-') === 0);
+
                 // IF MARKING AS PAID
                 if ($new_status === 'Paid' && $invData['status'] !== 'Paid') {
-                    
+
                     // ROUTE A: Wallet Top-Up
                     if ($invData['type'] === 'topup' || strpos($invoice_number, 'WAL-') === 0) {
                         $pdo->prepare("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?")
                             ->execute([$invData['amount'], $invData['user_id']]);
                     }
-                    // ROUTE B: Infrastructure Order/Renew
+                    // ROUTE B: Plan Upgrade — bump nodes_count, refresh total_price, DON'T extend expiry
+                    elseif ($is_upgrade && !empty($invData['panel_id']) && !empty($invData['pending_nodes_count'])) {
+                        vormox_apply_panel_upgrade(
+                            $pdo,
+                            $invData['panel_id'],
+                            $invData['pending_nodes_count'],
+                            $invData['billing_cycle']
+                        );
+                    }
+                    // ROUTE C: Infrastructure Order/Renew
                     elseif (!empty($invData['panel_id'])) {
-                        $cycle = $invData['billing_cycle'] ?? 'monthly';
-                        $current_expiry = $invData['expiry_date'];
-                        
-                        $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
-                        
-                        $months_to_add = 1;
-                        if ($cycle === 'quarterly') $months_to_add = 3;
-                        if ($cycle === 'semi_annually') $months_to_add = 6;
-                        if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
-                        
-                        $new_expiry = date('Y-m-d H:i:s', strtotime("+$months_to_add months", $base_time));
-                        
-                        $pdo->prepare("UPDATE user_panels SET expiry_date = ?, status = 'active' WHERE id = ?")
-                            ->execute([$new_expiry, $invData['panel_id']]);
+                        $was_expired_renewal = (
+                            !empty($invData['expiry_date'])
+                            && strtotime($invData['expiry_date']) < time()
+                        );
+
+                        $new_expiry_for_email = vormox_apply_panel_renewal(
+                            $pdo,
+                            $invData['panel_id'],
+                            $invData['billing_cycle'] ?? 'monthly',
+                            $invData['expiry_date']
+                        );
                     }
                 }
-                
+
                 // Update Invoice
                 $pdo->prepare("UPDATE invoices SET status = ? WHERE invoice_number = ?")->execute([$new_status, $invoice_number]);
                 $pdo->commit();
                 $success = "Invoice status updated to " . strtoupper($new_status) . ".";
+
+                // Payment receipt — only when status flipped TO Paid.
+                if ($new_status === 'Paid' && $invData['status'] !== 'Paid') {
+                    notify_invoice_paid(
+                        $invData['user_email'],
+                        $invData['user_first_name'],
+                        $invoice_number,
+                        $invData['amount'],
+                        "Payment confirmed by Vormox billing team."
+                    );
+                }
+
+                // After commit: notify on after-expiry renewal.
+                if ($was_expired_renewal && $new_expiry_for_email) {
+                    notify_panel_renewed_after_expiry(
+                        $invData['user_email'],
+                        $invData['user_first_name'],
+                        $invData['panel_domain'],
+                        $new_expiry_for_email
+                    );
+                }
             }
         } catch (PDOException $e) {
             $pdo->rollBack();
@@ -111,7 +152,7 @@ $page_title = 'Invoice ' . $invoice['invoice_number'];
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -263,7 +304,7 @@ $page_title = 'Invoice ' . $invoice['invoice_number'];
         <div style="display: flex; gap: 16px; align-items: center;">
             <button class="btn-outline" onclick="window.print()" style="background: transparent; border: 1px solid var(--border-strong); color: var(--text); padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; font-family: var(--font-body);"><i class="fa-solid fa-print"></i> Print PDF</button>
             
-            <form method="POST" style="display: flex; gap: 8px; margin: 0;">
+            <form method="POST" style="display: flex; gap: 8px; margin: 0;"><?= csrf_field() ?>
                 <select name="status" class="status-select">
                     <option value="Paid" <?= $invoice['status'] == 'Paid' ? 'selected' : '' ?>>Paid</option>
                     <option value="Unpaid" <?= $invoice['status'] == 'Unpaid' ? 'selected' : '' ?>>Unpaid</option>

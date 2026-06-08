@@ -2,9 +2,10 @@
 // Ensure session is started and DB is connected before this runs.
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 if (!isset($pdo)) { require_once 'config.php'; }
+require_once __DIR__ . '/includes/notifications.php';
 
 if (!isset($_SESSION['user_id'])) {
-    header("Location: login.php");
+    header("Location: signin.php");
     exit;
 }
 
@@ -17,7 +18,7 @@ $auth_user = $authStmt->fetch();
 // If user deleted from DB, log them out
 if (!$auth_user) {
     session_destroy();
-    header("Location: login.php");
+    header("Location: signin.php");
     exit;
 }
 
@@ -29,52 +30,26 @@ $user_theme = $auth_user['theme'] ?? 'dark'; // Fallback to dark
 // ==========================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_action'])) {
     header('Content-Type: application/json');
+    csrf_require();
 
     // Action: Send Email
     if ($_POST['auth_action'] === 'send_otp') {
-        $otp = rand(100000, 999999);
-        $_SESSION['verify_otp'] = $otp;
+        $otp = random_int(100000, 999999);
+        $_SESSION['verify_otp']      = (string) $otp;
         $_SESSION['verify_otp_time'] = time();
 
-        $curl = curl_init();
-        curl_setopt_array($curl, array(
-            CURLOPT_URL => "https://api.zeptomail.in/v1.1/email",
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_ENCODING => "",
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_TIMEOUT => 30,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_CUSTOMREQUEST => "POST",
-            CURLOPT_POSTFIELDS => json_encode([
-                "from" => [ "address" => "noreply@getwebup.com", "name" => "Vormox Security" ],
-                "to" => [ [ "email_address" => [ "address" => $auth_user['email'], "name" => $auth_user['first_name'] ] ] ],
-                "subject" => "Your Vormox Verification Code",
-                "htmlbody" => "
-                    <div style='font-family: Arial, sans-serif; padding: 30px; background: #050810; color: #e8edf8; text-align: center; border-radius: 12px;'>
-                        <h2 style='color: #fff;'>Verify Your Email</h2>
-                        <p style='color: #7a8aa8; font-size: 16px;'>Use the 6-digit code below to activate your Vormox account.</p>
-                        <div style='margin: 30px auto; padding: 20px; background: #111b35; border: 1px solid #8b5cf6; border-radius: 8px; display: inline-block;'>
-                            <strong style='font-size: 32px; letter-spacing: 5px; color: #a78bfa;'>{$otp}</strong>
-                        </div>
-                        <p style='color: #7a8aa8; font-size: 12px;'>This code expires in 15 minutes.</p>
-                    </div>"
-            ]),
-            CURLOPT_HTTPHEADER => array(
-                "accept: application/json",
-                "authorization: Zoho-enczapikey PHtE6r0LRbu9imR7pBQG7KC7F5asZI0tqbsxeVRFsIdCA/JRHk1RqooplDezr0h8A6RAFPWSwY5s4Lyd4O6FJWq5YD5IWWqyqK3sx/VYSPOZsbq6x00fsF8YdU3aVYTsdNFi3SXRvt3SNA==",
-                "cache-control: no-cache",
-                "content-type: application/json"
-            ),
-        ));
+        $ok = notify_email_verification_otp(
+            $auth_user['email'],
+            $auth_user['first_name'],
+            $otp,
+            15
+        );
 
-        $response = curl_exec($curl);
-        $err = curl_error($curl);
-        curl_close($curl);
-
-        if ($err) {
-            echo json_encode(['success' => false, 'message' => 'Failed to reach email server.']);
-        } else {
+        if ($ok) {
             echo json_encode(['success' => true]);
+        } else {
+            // notify_email_verification_otp already logged the reason via error_log
+            echo json_encode(['success' => false, 'message' => 'Failed to send the verification email. Please try again in a minute or contact support.']);
         }
         exit;
     }
@@ -107,7 +82,7 @@ if ($user_status === 'banned' || $user_status === 'unverified') {
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="<?= htmlspecialchars($user_theme) ?>">
-<head>
+<head><?= csrf_meta() ?>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vormox — Security</title>
@@ -234,9 +209,14 @@ if ($user_status === 'banned' || $user_status === 'unverified') {
                 btn.disabled = true;
 
                 const fd = new FormData();
+                fd.append('csrf_token', <?= json_encode(csrf_token()) ?>);
                 fd.append('auth_action', 'send_otp');
 
-                fetch('', { method: 'POST', body: fd })
+                fetch('', {
+                    method: 'POST',
+                    headers: { 'X-CSRF-Token': <?= json_encode(csrf_token()) ?> },
+                    body: fd
+                })
                 .then(res => res.json())
                 .then(data => {
                     if(data.success) {
@@ -267,10 +247,15 @@ if ($user_status === 'banned' || $user_status === 'unverified') {
                 btn.disabled = true;
 
                 const fd = new FormData();
+                fd.append('csrf_token', <?= json_encode(csrf_token()) ?>);
                 fd.append('auth_action', 'verify_otp');
                 fd.append('otp', otp);
 
-                fetch('', { method: 'POST', body: fd })
+                fetch('', {
+                    method: 'POST',
+                    headers: { 'X-CSRF-Token': <?= json_encode(csrf_token()) ?> },
+                    body: fd
+                })
                 .then(res => res.json())
                 .then(data => {
                     if(data.success) {

@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 
 // --- HANDLE POST ACTIONS ---
@@ -46,7 +48,7 @@ $page_title = 'Global Settings';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -192,7 +194,7 @@ $page_title = 'Global Settings';
         
         <!-- LEFT COLUMN: GENERAL SETTINGS -->
         <div>
-            <form method="POST" action="settings.php" class="card">
+            <form method="POST" action="settings.php" class="card"><?= csrf_field() ?>
                 <div class="card-title"><i class="fa-solid fa-sliders" style="color: var(--accent);"></i> General Preferences</div>
                 <div class="card-body">
                     <div class="form-row">
@@ -232,7 +234,7 @@ $page_title = 'Global Settings';
                 </div>
             </form>
 
-            <form method="POST" action="settings.php" class="card">
+            <form method="POST" action="settings.php" class="card"><?= csrf_field() ?>
                 <div class="card-title"><i class="fa-solid fa-shield-check" style="color: var(--accent-green);"></i> Security & Policy</div>
                 <div class="card-body">
                     <div class="toggle-wrapper">
@@ -273,7 +275,7 @@ $page_title = 'Global Settings';
             <div class="card">
                 <div class="card-title"><i class="fa-solid fa-screwdriver-wrench" style="color: var(--accent-orange);"></i> System Maintenance</div>
                 <div class="card-body">
-                    <form method="POST" action="settings.php" style="margin-bottom: 32px;">
+                    <form method="POST" action="settings.php" style="margin-bottom: 32px;"><?= csrf_field() ?>
                         <div style="margin-bottom: 16px; font-size: 14px; line-height: 1.5; color: var(--text-muted);">
                             If you are making structural changes to the database or updating panel infrastructure, enable Maintenance Mode to lock out clients temporarily.
                         </div>
@@ -293,7 +295,7 @@ $page_title = 'Global Settings';
 
                     <hr style="border: none; border-top: 1px solid var(--border); margin: 32px 0;">
 
-                    <form method="POST" action="settings.php">
+                    <form method="POST" action="settings.php"><?= csrf_field() ?>
                         <h4 style="font-family: var(--font-head); font-size: 14px; margin-bottom: 8px; color: var(--text);">Clear System Cache</h4>
                         <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 16px;">
                             Purge compiled templates, routing cache, and temporary session data.

@@ -29,6 +29,7 @@ if (isset($_SESSION['admin_id']) && $_SESSION['admin_logged_in'] === true) {
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_require();
     $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
     $password = $_POST['password'] ?? '';
 
@@ -45,6 +46,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $updateStmt->execute(['ip' => $user_ip, 'id' => $admin['id']]);
 
                 session_regenerate_id(true);
+                csrf_rotate();
                 $_SESSION['admin_id'] = $admin['id'];
                 $_SESSION['admin_logged_in'] = true;
 
@@ -62,7 +64,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Admin Portal — Vormox Automation Cloud</title>
@@ -166,7 +168,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     <?php endif; ?>
 
-    <form method="POST" action="login.php">
+    <form method="POST" action="login.php"><?= csrf_field() ?>
       <div class="form-group">
         <label for="email">Admin Email</label>
         <input type="email" id="email" name="email" placeholder="admin@vormox.com" required value="<?= htmlspecialchars($_POST['email'] ?? '') ?>">

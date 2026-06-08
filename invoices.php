@@ -15,6 +15,7 @@ $error = '';
 
 // --- Handle Billing Settings Update (Using UPSERT) ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_billing'])) {
+    csrf_require();
     
     $billing_type = filter_input(INPUT_POST, 'billing_type', FILTER_SANITIZE_SPECIAL_CHARS) ?: 'individual';
     $company_name = filter_input(INPUT_POST, 'company_name', FILTER_SANITIZE_SPECIAL_CHARS);
@@ -251,7 +252,7 @@ include 'includes/header.php';
         <h3 style="font-family: var(--font-head); margin-bottom: 8px;">Top Up Wallet</h3>
         <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 24px;">Enter the amount of USD you want to add.</p>
         
-        <form method="POST" action="add_funds.php">
+        <form method="POST" action="add_funds.php"><?= csrf_field() ?>
             <input type="number" name="amount" class="input-amount" min="1" max="5000" step="1" placeholder="$10.00" required>
             <div style="display: flex; gap: 8px; margin-top: 16px;">
                 <button type="button" class="btn-outline btn-action" onclick="closeAddFundsModal()" style="flex: 1; justify-content: center;">Cancel</button>
@@ -268,7 +269,7 @@ include 'includes/header.php';
             <button onclick="closeBillingModal()" style="background: transparent; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer;"><i class="fa-solid fa-xmark"></i></button>
         </div>
         
-        <form method="POST" action="invoices.php">
+        <form method="POST" action="invoices.php"><?= csrf_field() ?>
             
             <div class="form-row">
                 <div class="form-group">

@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 // ==========================================
 // HANDLE AUTO-SAVE (AJAX) - UPSERT FIX
 // ==========================================
@@ -25,20 +27,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['autosave'])) {
     if (!$panel_id) { echo json_encode(['success' => false, 'error' => 'Missing Panel ID']); exit; }
     
     try {
-        // Robust UPSERT: Creates the row if it doesn't exist, updates it if it does
+        // Robust UPSERT: Creates the row if it doesn't exist, updates it if it does.
+        // be_status / fe_status are NOT NULL with no DB default — must be supplied
+        // on the first INSERT or strict mode rejects the row.
         $sql = "INSERT INTO panel_details (
-            panel_id, 
-            be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass,
-            fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass,
+            panel_id,
+            be_service, be_server_ip, be_ssh_port, be_ssh_user, be_ssh_pass, be_git_url, be_git_user, be_git_pass, be_status,
+            fe_service, fe_server_ip, fe_ssh_port, fe_ssh_user, fe_ssh_pass, fe_git_url, fe_git_user, fe_git_pass, fe_status,
             rp_service, rp_server_ip, rp_ssh_port, rp_ssh_user, rp_ssh_pass,
             db_server_ip, db_name, db_user, db_pass, status
         ) VALUES (
-            :pid, 
-            :besrv, :beip, :beport, :beusr, :bepass, :begit, :begitu, :begitp,
-            :fesrv, :feip, :feport, :feusr, :fepass, :fegit, :fegitu, :fegitp,
+            :pid,
+            :besrv, :beip, :beport, :beusr, :bepass, :begit, :begitu, :begitp, 'pending',
+            :fesrv, :feip, :feport, :feusr, :fepass, :fegit, :fegitu, :fegitp, 'pending',
             :rpsrv, :rpip, :rpport, :rpusr, :rppass,
             :dbip, :dbname, :dbusr, :dbpass, 'draft'
-        ) ON DUPLICATE KEY UPDATE 
+        ) ON DUPLICATE KEY UPDATE
             be_service = VALUES(be_service), be_server_ip = VALUES(be_server_ip), be_ssh_port = VALUES(be_ssh_port), be_ssh_user = VALUES(be_ssh_user), be_ssh_pass = VALUES(be_ssh_pass), be_git_url = VALUES(be_git_url), be_git_user = VALUES(be_git_user), be_git_pass = VALUES(be_git_pass),
             fe_service = VALUES(fe_service), fe_server_ip = VALUES(fe_server_ip), fe_ssh_port = VALUES(fe_ssh_port), fe_ssh_user = VALUES(fe_ssh_user), fe_ssh_pass = VALUES(fe_ssh_pass), fe_git_url = VALUES(fe_git_url), fe_git_user = VALUES(fe_git_user), fe_git_pass = VALUES(fe_git_pass),
             rp_service = VALUES(rp_service), rp_server_ip = VALUES(rp_server_ip), rp_ssh_port = VALUES(rp_ssh_port), rp_ssh_user = VALUES(rp_ssh_user), rp_ssh_pass = VALUES(rp_ssh_pass),
@@ -149,7 +153,7 @@ $page_title = 'Order Management';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -300,7 +304,7 @@ $page_title = 'Order Management';
 
     <?php if ($view === 'list'): ?>
         
-        <form method="POST" action="orders.php" class="card">
+        <form method="POST" action="orders.php" class="card"><?= csrf_field() ?>
             <div class="card-title">
                 <div><i class="fa-solid fa-clock" style="color: var(--accent-orange);"></i> Awaiting Provisioning</div>
                 <div class="toolbar">
@@ -360,7 +364,7 @@ $page_title = 'Order Management';
 
         <a href="orders.php" class="btn btn-back"><i class="fa-solid fa-arrow-left"></i> Back to Orders</a>
         
-        <form method="POST" action="orders.php" class="card" id="fulfillForm">
+        <form method="POST" action="orders.php" class="card" id="fulfillForm"><?= csrf_field() ?>
             <input type="hidden" name="panel_id" value="<?= htmlspecialchars($order['id']) ?>">
             
             <div class="card-title" style="justify-content: space-between;">

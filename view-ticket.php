@@ -17,8 +17,28 @@ if (!$ticket_id) {
     exit;
 }
 
+// Handle Close Ticket (user-side)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['close_ticket'])) {
+    csrf_require();
+    try {
+        $stmt = $pdo->prepare("
+            UPDATE tickets
+               SET status = 'Closed', updated_at = NOW()
+             WHERE reference_id = :ref AND user_id = :uid
+        ");
+        $stmt->execute(['ref' => $ticket_id, 'uid' => $_SESSION['user_id']]);
+
+        header("Location: view-ticket.php?id=" . urlencode($ticket_id));
+        exit;
+    } catch (PDOException $e) {
+        error_log("Close ticket error: " . $e->getMessage());
+        $error = "Failed to close the ticket. Please try again.";
+    }
+}
+
 // Handle New Message Post
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reply_message'])) {
+    csrf_require();
     $reply_message = trim(filter_input(INPUT_POST, 'reply_message', FILTER_SANITIZE_SPECIAL_CHARS));
     
     if (empty($reply_message)) {
@@ -207,9 +227,19 @@ include 'includes/header.php';
     <?php if ($ticket_details['status'] !== 'Closed'): ?>
       <div class="reply-box">
         <div class="reply-title">Add a Reply</div>
-        <form method="POST" action="view-ticket.php?id=<?= htmlspecialchars($ticket_id) ?>">
+        <form method="POST" action="view-ticket.php?id=<?= htmlspecialchars($ticket_id) ?><?= csrf_field() ?>"><?= csrf_field() ?>
           <textarea name="reply_message" placeholder="Type your message here..." required></textarea>
-          <button type="submit" class="btn-submit"><i class="fa-solid fa-paper-plane" style="margin-right: 8px;"></i> Send Reply</button>
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px;">
+            <button type="submit" class="btn-submit"><i class="fa-solid fa-paper-plane" style="margin-right: 8px;"></i> Send Reply</button>
+            <button type="submit"
+                    name="close_ticket"
+                    value="1"
+                    formnovalidate
+                    onclick="return confirm('Close this ticket? You can always open a new one if you need more help.');"
+                    style="background: transparent; color: var(--text-muted); border: 1px solid var(--border-strong); padding: 10px 18px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 13px;">
+                <i class="fa-solid fa-circle-check"></i> Close Ticket
+            </button>
+          </div>
         </form>
       </div>
     <?php else: ?>

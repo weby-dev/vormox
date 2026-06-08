@@ -15,6 +15,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 
 // --- UPDATE TICKET STATUS ---
@@ -78,7 +80,7 @@ $page_title = 'Support Tickets';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -283,7 +285,7 @@ $page_title = 'Support Tickets';
                         </td>
                         <td>
                             <div style="display: flex; justify-content: flex-end; align-items: center; gap: 12px;">
-                                <form method="POST" action="tickets.php" class="inline-form">
+                                <form method="POST" action="tickets.php" class="inline-form"><?= csrf_field() ?>
                                     <input type="hidden" name="ticket_id" value="<?= htmlspecialchars($t['id']) ?>">
                                     <select name="status" class="status-select" onchange="this.form.submit()">
                                         <option value="Open" <?= $t['status']=='Open'?'selected':'' ?>>Open</option>

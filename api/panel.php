@@ -2,8 +2,12 @@
 require_once __DIR__ . '/../config.php';
 header('Content-Type: application/json');
 
-// Move this to config.php ideally, or to an environment variable
-$TOKEN = 'mf43owpwxcgs60sdzp6rndl48g';
+$TOKEN = vormox_env('API_PANEL_TOKEN', '');
+if ($TOKEN === '') {
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => 'API_PANEL_TOKEN is not configured.']);
+    exit;
+}
 
 /**
  * Reliably retrieve the Authorization header across different

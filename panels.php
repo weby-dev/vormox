@@ -8,12 +8,15 @@ if (!isset($_SESSION['user_id']) || $_SESSION['logged_in'] !== true) {
 
 require_once 'config.php';
 require_once 'auth_guard.php';
+require_once 'includes/notifications.php';
+require_once 'includes/pricing.php';
 
 $error = '';
 $success = '';
 $user_id = $_SESSION['user_id'];
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'toggle_autorenew') {
+    csrf_require();
     $panel_id = filter_input(INPUT_POST, 'panel_id', FILTER_VALIDATE_INT);
     $auto_renew = filter_input(INPUT_POST, 'auto_renew', FILTER_VALIDATE_INT);
 
@@ -30,17 +33,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_panel'])) {
+    csrf_require();
     $domain = trim(filter_input(INPUT_POST, 'domain', FILTER_SANITIZE_URL));
     $nodes = filter_input(INPUT_POST, 'nodes_count', FILTER_VALIDATE_INT);
     $billing_cycle = filter_input(INPUT_POST, 'billing_cycle', FILTER_SANITIZE_SPECIAL_CHARS);
 
-    $cycle_months = [ 'monthly' => 1, 'quarterly' => 3, 'semi_annually' => 6, 'annually' => 12 ];
-    $months = $cycle_months[$billing_cycle] ?? 0;
+    $months = vormox_cycle_months($billing_cycle);
+    $valid_cycle = isset(VORMOX_CYCLE_MONTHS[strtolower((string)$billing_cycle)]);
 
-    if (empty($domain) || !$nodes || !$months) {
+    if (empty($domain) || !$nodes || !$valid_cycle) {
         $error = "Please provide valid inputs for all fields.";
-    } elseif ($nodes > 25) {
-        $error = "For more than 25 nodes, please contact our enterprise support team.";
+    } elseif ($nodes > VORMOX_MAX_NODES) {
+        $error = "For more than " . VORMOX_MAX_NODES . " nodes, please contact our enterprise support team.";
     } else {
         $checkStmt = $pdo->prepare("SELECT id FROM user_panels WHERE domain = :domain AND status IN ('payment_pending', 'pending', 'creating', 'active', 'restarting', 'suspended', 'error') LIMIT 1");
         $checkStmt->execute(['domain' => $domain]);
@@ -48,8 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_panel'])) {
         if ($checkStmt->fetch()) {
             $error = "The domain '$domain' is already in use by an active panel.";
         } else {
-            $price_per_node = ($nodes >= 11) ? 8 : (($nodes >= 5) ? 9 : 10);
-            $total_price = ($nodes * $price_per_node) * $months;
+            $total_price = vormox_calculate_panel_total($nodes, $billing_cycle);
 
             try {
                 $pdo->beginTransaction();
@@ -66,8 +69,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_panel'])) {
                 $period_end = date('Y-m-d', strtotime("+$months months"));
 
                 $invStmt = $pdo->prepare("
-                    INSERT INTO invoices (user_id, panel_id, invoice_number, amount, status, due_date, period_start, period_end, created_at) 
-                    VALUES (:uid, :pid, :inv_num, :amount, 'Unpaid', :due, :p_start, :p_end, NOW())
+                    INSERT INTO invoices (user_id, panel_id, invoice_number, amount, type, status, due_date, period_start, period_end, created_at)
+                    VALUES (:uid, :pid, :inv_num, :amount, 'order', 'Unpaid', :due, :p_start, :p_end, NOW())
                 ");
                 $invStmt->execute([
                     'uid' => $user_id, 
@@ -81,6 +84,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_panel'])) {
 
                 $pdo->commit();
                 $success = "Panel requested and Invoice #$invoice_number generated successfully.";
+
+                // Fire "new invoice" email — uses session user info already loaded later,
+                // so fetch contact info inline.
+                try {
+                    $mailStmt = $pdo->prepare("SELECT email, first_name FROM users WHERE id = ? LIMIT 1");
+                    $mailStmt->execute([$user_id]);
+                    if ($u = $mailStmt->fetch()) {
+                        notify_invoice_created(
+                            $u['email'],
+                            $u['first_name'],
+                            $invoice_number,
+                            $total_price,
+                            $due_date,
+                            "New order placed for <strong>{$domain}</strong> — {$nodes} node(s), {$billing_cycle} billing."
+                        );
+                    }
+                } catch (PDOException $e) { error_log("Order email lookup failed: " . $e->getMessage()); }
             } catch (PDOException $e) {
                 $pdo->rollBack();
                 $error = "An error occurred while provisioning your panel.";
@@ -459,7 +479,7 @@ include 'includes/header.php';
             <button id="closeModalBtn" class="btn-close"><i class="fa-solid fa-xmark"></i></button>
         </div>
         
-        <form method="POST" action="panels.php">
+        <form method="POST" action="panels.php"><?= csrf_field() ?>
             <div class="form-group">
                 <label class="field-label" for="domain">Domain Name</label>
                 <input type="text" id="domain" name="domain" required placeholder="panel.yourdomain.com" autocomplete="off">
@@ -516,10 +536,15 @@ function runBulk(type) {
 
     for (const id of ids) {
         const formData = new FormData();
+        formData.append('csrf_token', window.CSRF_TOKEN || '');
         formData.append('ajax_action', action);
         formData.append('service_type', type);
-        
-        let p = fetch(`ajax_service_handler.php?id=${id}`, { method: 'POST', body: formData });
+
+        let p = fetch(`ajax_service_handler.php?id=${id}`, {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+            body: formData
+        });
         promises.push(p);
     }
 
@@ -547,10 +572,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const originalState = !this.checked;
             try {
                 const formData = new URLSearchParams();
+                formData.append('csrf_token', window.CSRF_TOKEN || '');
                 formData.append('action', 'toggle_autorenew');
                 formData.append('panel_id', panelId);
                 formData.append('auto_renew', isChecked);
-                const response = await fetch('panels.php', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: formData });
+                const response = await fetch('panels.php', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-CSRF-Token': window.CSRF_TOKEN || ''
+                    },
+                    body: formData
+                });
                 const data = await response.json();
                 if (!data.success) throw new Error('Failed');
             } catch (error) {

@@ -17,6 +17,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 
 // --- HANDLE POST ACTIONS (ADD / REMOVE IP) ---
@@ -95,7 +97,7 @@ $page_title = 'Access Security';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -243,7 +245,7 @@ $page_title = 'Access Security';
                     <i class="fa-solid fa-circle-info"></i> If the whitelist is entirely empty, the system allows access from anywhere. The moment one IP is added, <strong>strict IP locking</strong> is enabled for all admin panels.
                 </div>
 
-                <form method="POST" action="security.php">
+                <form method="POST" action="security.php"><?= csrf_field() ?>
                     <div class="form-group">
                         <label>IP Address (IPv4 / IPv6)</label>
                         <input type="text" name="ip_address" class="form-control" value="<?= htmlspecialchars($user_ip) ?>" required placeholder="e.g. 192.168.1.1">
@@ -301,7 +303,7 @@ $page_title = 'Access Security';
                                     <?php if($is_current): ?>
                                         <button class="btn-disabled" title="Cannot remove active session IP"><i class="fa-solid fa-ban"></i></button>
                                     <?php else: ?>
-                                        <form method="POST" action="security.php" style="margin: 0;" onsubmit="return confirm('Are you sure you want to revoke access for this IP?');">
+                                        <form method="POST" action="security.php" style="margin: 0;" onsubmit="return confirm('Are you sure you want to revoke access for this IP?');"><?= csrf_field() ?>
                                             <input type="hidden" name="whitelist_id" value="<?= htmlspecialchars($wl['id']) ?>">
                                             <input type="hidden" name="target_ip" value="<?= htmlspecialchars($wl['ip_address']) ?>">
                                             <button type="submit" name="remove_ip" class="btn-danger"><i class="fa-solid fa-trash-can"></i> Revoke</button>

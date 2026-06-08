@@ -13,7 +13,8 @@ $success = '';
 
 // --- HANDLE FORM SUBMISSIONS ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    
+    csrf_require();
+
     // 1. Update Personal Information
     if (isset($_POST['update_profile'])) {
         $first_name = trim(filter_input(INPUT_POST, 'first_name', FILTER_SANITIZE_SPECIAL_CHARS));
@@ -160,7 +161,7 @@ include 'includes/header.php';
                 <div class="card-title"><i class="fa-solid fa-user" style="color: var(--accent2); margin-right: 8px;"></i> Personal Information</div>
             </div>
             
-            <form method="POST" action="profile.php">
+            <form method="POST" action="profile.php"><?= csrf_field() ?>
                 <div class="form-group">
                     <label for="first_name">First Name</label>
                     <input type="text" id="first_name" name="first_name" required value="<?= htmlspecialchars($user['first_name']) ?>">
@@ -187,7 +188,7 @@ include 'includes/header.php';
                 <div class="card-title"><i class="fa-solid fa-shield-halved" style="color: var(--accent-green); margin-right: 8px;"></i> Security</div>
             </div>
             
-            <form method="POST" action="profile.php">
+            <form method="POST" action="profile.php"><?= csrf_field() ?>
                 <div class="form-group">
                     <label for="current_password">Current Password</label>
                     <input type="password" id="current_password" name="current_password" required placeholder="Enter current password">

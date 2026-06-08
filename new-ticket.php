@@ -33,6 +33,7 @@ try {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_require();
     $department_id = filter_input(INPUT_POST, 'department_id', FILTER_VALIDATE_INT);
     $priority = filter_input(INPUT_POST, 'priority', FILTER_SANITIZE_SPECIAL_CHARS);
     $subject = trim(filter_input(INPUT_POST, 'subject', FILTER_SANITIZE_SPECIAL_CHARS));
@@ -149,8 +150,7 @@ include 'includes/header.php';
   </div>
 
   <div class="form-card">
-    <form method="POST" action="new-ticket.php" enctype="multipart/form-data">
-      
+    <form method="POST" action="new-ticket.php" enctype="multipart/form-data"><?= csrf_field() ?>
       <div class="form-row">
         <div class="form-group">
           <label for="department_id">Department</label>

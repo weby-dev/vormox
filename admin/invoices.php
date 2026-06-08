@@ -1,6 +1,8 @@
 <?php
 session_start();
-require_once '../config.php'; 
+require_once '../config.php';
+require_once '../includes/notifications.php';
+require_once '../includes/pricing.php';
 
 // --- SECURITY BOILERPLATE ---
 $user_ip = $_SERVER['REMOTE_ADDR'];
@@ -15,6 +17,8 @@ try {
 
 if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { header("Location: login.php"); exit; }
 
+
+csrf_require();
 $success = ''; $error = '';
 
 // --- HANDLE POST: BULK UPDATE INVOICE STATUS ---
@@ -30,44 +34,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['bulk_update_invoices'
                 $pdo->beginTransaction();
                 
                 $chkStmt = $pdo->prepare("
-                    SELECT i.status, i.panel_id, i.type, i.amount, i.user_id, p.billing_cycle, p.expiry_date 
-                    FROM invoices i 
-                    LEFT JOIN user_panels p ON i.panel_id = p.id 
+                    SELECT i.status, i.panel_id, i.type, i.amount, i.user_id, i.invoice_number,
+                           u.email AS user_email, u.first_name AS user_first_name,
+                           p.billing_cycle, p.expiry_date, p.pending_nodes_count, p.domain AS panel_domain
+                    FROM invoices i
+                    JOIN users u       ON u.id = i.user_id
+                    LEFT JOIN user_panels p ON i.panel_id = p.id
                     WHERE i.id = ? FOR UPDATE
                 ");
                 $chkStmt->execute([$inv_id]);
                 $invData = $chkStmt->fetch();
-                
+
+                $was_expired_renewal  = false;
+                $new_expiry_for_email = null;
+
                 // IF MARKING AS PAID
                 if ($new_status === 'Paid' && $invData && $invData['status'] !== 'Paid') {
-                    
+
+                    $is_upgrade = (strpos($invData['invoice_number'] ?? '', 'UPG-') === 0);
+
                     // ROUTE A: Wallet Top-Up
                     if ($invData['type'] === 'topup' || strpos($invData['invoice_number'] ?? '', 'WAL-') === 0) {
                         $pdo->prepare("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?")
                             ->execute([$invData['amount'], $invData['user_id']]);
                     }
-                    // ROUTE B: Infrastructure Order/Renew
+                    // ROUTE B: Plan Upgrade — bump nodes, don't extend expiry
+                    elseif ($is_upgrade && !empty($invData['panel_id']) && !empty($invData['pending_nodes_count'])) {
+                        vormox_apply_panel_upgrade(
+                            $pdo,
+                            $invData['panel_id'],
+                            $invData['pending_nodes_count'],
+                            $invData['billing_cycle']
+                        );
+                    }
+                    // ROUTE C: Infrastructure Order/Renew
                     elseif (!empty($invData['panel_id'])) {
-                        $cycle = $invData['billing_cycle'] ?? 'monthly';
-                        $current_expiry = $invData['expiry_date'];
-                        
-                        $base_time = (empty($current_expiry) || strtotime($current_expiry) < time()) ? time() : strtotime($current_expiry);
-                        
-                        $months_to_add = 1;
-                        if ($cycle === 'quarterly') $months_to_add = 3;
-                        if ($cycle === 'semi_annually') $months_to_add = 6;
-                        if ($cycle === 'yearly' || $cycle === 'annually') $months_to_add = 12;
-                        
-                        $new_expiry = date('Y-m-d H:i:s', strtotime("+$months_to_add months", $base_time));
-                        
-                        $pdo->prepare("UPDATE user_panels SET expiry_date = ?, status = 'active' WHERE id = ?")
-                            ->execute([$new_expiry, $invData['panel_id']]);
+                        $was_expired_renewal = (
+                            !empty($invData['expiry_date'])
+                            && strtotime($invData['expiry_date']) < time()
+                        );
+
+                        $new_expiry_for_email = vormox_apply_panel_renewal(
+                            $pdo,
+                            $invData['panel_id'],
+                            $invData['billing_cycle'] ?? 'monthly',
+                            $invData['expiry_date']
+                        );
                     }
                 }
                 
                 $pdo->prepare("UPDATE invoices SET status = ? WHERE id = ?")->execute([$new_status, $inv_id]);
                 $pdo->commit();
                 $processed++;
+
+                // Notifications (after commit, never inside the transaction)
+                if ($new_status === 'Paid' && $invData && $invData['status'] !== 'Paid') {
+                    notify_invoice_paid(
+                        $invData['user_email'],
+                        $invData['user_first_name'],
+                        $invData['invoice_number'],
+                        $invData['amount'],
+                        "Payment confirmed by Vormox billing team."
+                    );
+                }
+                if (!empty($was_expired_renewal) && !empty($new_expiry_for_email) && $invData) {
+                    notify_panel_renewed_after_expiry(
+                        $invData['user_email'],
+                        $invData['user_first_name'],
+                        $invData['panel_domain'],
+                        $new_expiry_for_email
+                    );
+                }
             }
             
             $success = "Successfully updated $processed invoice(s). Extensions and Wallet top-ups applied where necessary.";
@@ -109,7 +146,7 @@ $page_title = 'Global Billing & Invoices';
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -234,7 +271,7 @@ $page_title = 'Global Billing & Invoices';
 
   <div class="content-area">
     
-    <form method="POST" action="invoices.php" class="card">
+    <form method="POST" action="invoices.php" class="card"><?= csrf_field() ?>
         <div class="card-title">
             <div style="color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent-green); margin-right: 8px;"></i> Global Billing History</div>
             

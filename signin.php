@@ -11,6 +11,7 @@ require_once 'config.php';
 $error = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_require();
     $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
     $password = $_POST['password'] ?? '';
 
@@ -29,6 +30,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $updateStmt->execute(['ip' => $ip_address, 'id' => $user['id']]);
 
                 session_regenerate_id(true);
+                csrf_rotate();
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['logged_in'] = true;
 
@@ -46,7 +48,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 ?>
 <!DOCTYPE html>
 <html lang="en" data-theme="dark">
-<head>
+<head><?= csrf_meta() ?>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Sign In — Vormox Automation Cloud</title>
@@ -216,7 +218,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
     <?php endif; ?>
 
-    <form method="POST" action="signin.php">
+    <form method="POST" action="signin.php"><?= csrf_field() ?>
       <div class="form-group">
         <div class="label-wrapper">
           <label for="email">Email Address</label>

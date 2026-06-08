@@ -46,30 +46,51 @@ try {
 // ==========================================
 // 3. SSH EXECUTION ENGINE
 // ==========================================
-function execute_ssh_command($ip, $port, $user, $pass, $command) {
+function execute_ssh_command($ip, $port, $user, $pass, $command, $timeout = 5) {
     if (!function_exists('ssh2_connect')) {
         return ['success' => false, 'output' => "Error: PHP ssh2 extension missing on web server."];
     }
-    
-    $connection = @ssh2_connect($ip, $port ?: 22);
-    if (!$connection) return ['success' => false, 'output' => "SSH Connection failed to $ip:$port"];
-    
-    if (!@ssh2_auth_password($connection, $user, $pass)) {
-        return ['success' => false, 'output' => "SSH Authentication failed for user '$user'."];
+    $port = (int) ($port ?: 22);
+
+    // Pre-check at the TCP layer so an unreachable IP fails in $timeout
+    // seconds instead of blocking the PHP worker for 60+.
+    $errno = 0; $errstr = '';
+    $sock = @stream_socket_client("tcp://{$ip}:{$port}", $errno, $errstr, $timeout);
+    if (!$sock) {
+        return ['success' => false, 'output' => "SSH host unreachable: {$ip}:{$port} ({$errstr})"];
     }
-    
-    $stream = ssh2_exec($connection, $command);
-    if (!$stream) return ['success' => false, 'output' => "Command execution failed."];
-    
+    fclose($sock);
+
+    $connection = @ssh2_connect($ip, $port);
+    if (!$connection) return ['success' => false, 'output' => "SSH handshake failed to {$ip}:{$port}"];
+
+    if (!@ssh2_auth_password($connection, $user, $pass)) {
+        return ['success' => false, 'output' => "SSH authentication failed for '{$user}'."];
+    }
+
+    $stream = @ssh2_exec($connection, $command);
+    if (!$stream) return ['success' => false, 'output' => "SSH command execution failed."];
+
     stream_set_blocking($stream, true);
-    $output = stream_get_contents(ssh2_fetch_stream($stream, SSH2_STREAM_STDIO));
-    return ['success' => true, 'output' => $output];
+    stream_set_timeout($stream, $timeout * 2);
+
+    $stdio = @ssh2_fetch_stream($stream, SSH2_STREAM_STDIO);
+    if (!$stdio) return ['success' => false, 'output' => "SSH stream open failed."];
+    stream_set_blocking($stdio, true);
+    stream_set_timeout($stdio, $timeout * 2);
+
+    $output = @stream_get_contents($stdio);
+    @fclose($stdio);
+    @fclose($stream);
+
+    return ['success' => true, 'output' => $output !== false ? $output : ''];
 }
 
 // ==========================================
 // 4. ACTION DISPATCHER (POST)
 // ==========================================
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action'])) {
+    csrf_require();
     $action = filter_input(INPUT_POST, 'ajax_action', FILTER_SANITIZE_SPECIAL_CHARS);
     $type = filter_input(INPUT_POST, 'service_type', FILTER_SANITIZE_SPECIAL_CHARS); // 'be' or 'fe'
 
