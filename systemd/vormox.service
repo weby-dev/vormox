@@ -1,0 +1,74 @@
+# /etc/systemd/system/vormox.service
+#
+# Runs the Vormox PHP frontend behind systemd. This uses PHP's built-in
+# development server (`php -S`) which is fine for dev or low-traffic
+# internal admin tools — but for production you should switch to
+# nginx + php-fpm (see systemd/README.md).
+#
+# Install:
+#   sudo cp /root/vormox/systemd/vormox.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vormox
+#   sudo systemctl status vormox
+#
+# Logs:
+#   sudo journalctl -u vormox -f               # live tail
+#   sudo journalctl -u vormox --since "1h ago" # recent
+#
+# Restart after deploy:
+#   sudo systemctl restart vormox
+
+[Unit]
+Description=Vormox PHP Frontend
+Documentation=https://github.com/vormox
+After=network-online.target mysql.service
+Wants=network-online.target
+
+# If we crash-loop more than 5 times in 60s, stop trying — investigate.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Adjust if you ship under a non-root user (recommended for prod — see README).
+User=root
+Group=root
+
+WorkingDirectory=/root/vormox
+ExecStart=/usr/bin/php -S 0.0.0.0:8000 -t /root/vormox
+
+# php-built-in is single-threaded; if it dies (fatal, OOM, crashed extension),
+# restart fast so the nginx reverse-proxy doesn't sit on a 502 for long.
+Restart=always
+RestartSec=3
+
+# Stop quickly on `systemctl stop` — no graceful drain to wait for.
+TimeoutStopSec=10
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logs go to journald — view with `journalctl -u vormox`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vormox
+
+# Cap memory at 512MB — kills runaway PHP scripts instead of OOMing the host.
+MemoryMax=512M
+
+# Allow many concurrent connections (default is 1024 which is fine for php -S,
+# but raise it if you ever move to fpm).
+LimitNOFILE=4096
+
+# Hardening — drop privileges the daemon doesn't need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
