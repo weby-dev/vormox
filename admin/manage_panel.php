@@ -448,7 +448,8 @@ $page_title = 'Manage: ' . $panel['domain'];
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Build & Deployment</div>
                     
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-                        <button type="button" onclick="runAction('create', 'be', this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Backend</button>
+                        <!-- Create Backend → runs the first-time installer over SSH on the BE host. -->
+                        <button type="button" id="createBackendBtn" onclick="createBackend(this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Backend</button>
                         <button type="button" onclick="runAction('update', 'be', this)" class="control-btn btn-update" style="margin: 0;"><i class="fa-brands fa-git-alt"></i> Update Code</button>
                     </div>
                     
@@ -741,6 +742,62 @@ function confirmTermination() {
             btn.innerHTML = originalHtml;
             btn.disabled = false;
         });
+}
+
+// --- CREATE BACKEND (first-time installer) ---
+// Fires the SSH installer documented in admin/setup_backend.php. The bash
+// script runs detached on the backend host and writes progress to
+// /var/log/vormox/<domain>-task.log — which this page already tails when
+// the log dropdown is set to "Backend Build & Task Progress".
+async function createBackend(btn) {
+    const confirmMsg =
+        'Run the FIRST-TIME backend installer on this panel?\n\n' +
+        '• apt update + apt install (git, maven, openjdk-21-jdk)\n' +
+        '• git clone the backend repo\n' +
+        '• mvn clean package -DskipTests (several minutes)\n' +
+        '• write /etc/systemd/system/<service>.service\n' +
+        '• systemctl enable + restart\n\n' +
+        'Total time: 5–10 minutes. Progress streams to the terminal below.\n' +
+        'Existing /root/somaniOne-main will be wiped before clone.';
+    if (!confirm(confirmMsg)) return;
+
+    const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Launching installer…';
+
+    try {
+        const fd = new FormData();
+        fd.append('csrf_token', csrf);
+        fd.append('panel_id', panelId);
+
+        const res = await fetch('setup_backend.php', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrf },
+            body: fd
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            showToast('success', data.message || 'Installer started.');
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Installer running…';
+            // Auto-switch the terminal to the build/task log so admin
+            // doesn't have to fish for it in the dropdown.
+            const logSel = document.getElementById('logSource');
+            if (logSel && Array.from(logSel.options).some(o => o.value === 'be_task')) {
+                logSel.value = 'be_task';
+                logSel.dispatchEvent(new Event('change'));
+            }
+        } else {
+            showToast('error', data.message || 'Could not start installer.');
+            btn.innerHTML = original;
+            btn.disabled = false;
+        }
+    } catch (err) {
+        showToast('error', 'Network error launching installer.');
+        btn.innerHTML = original;
+        btn.disabled = false;
+    }
 }
 
 // --- ACTION LOGIC ---

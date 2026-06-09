@@ -447,25 +447,8 @@ $page_title = 'Order Management';
             <div style="padding: 0 32px 32px; display: flex; justify-content: flex-end; align-items: center; gap: 12px; flex-wrap: wrap;">
                 <div id="autosaveIndicator" style="margin-right: auto;"></div>
 
-                <!--
-                    Start Backend Setup.
-                    Disabled until every required field is filled and the latest autosave
-                    has flushed. Java app takes ~2–3 minutes; the SSH installer runs detached
-                    and progress streams via the "Backend Build & Task Progress" terminal
-                    on manage_panel.php.
-                -->
-                <button type="button"
-                        id="startBackendSetupBtn"
-                        class="btn"
-                        disabled
-                        title="Fill in every required backend & DB field to enable this."
-                        style="padding: 14px 24px; font-size: 14px; background: rgba(34,211,238,0.1); color: var(--accent-green); border: 1px solid rgba(34,211,238,0.3); border-radius: 8px; cursor: not-allowed; opacity: 0.55; transition: 0.2s;">
-                    <i class="fa-solid fa-rocket"></i>
-                    <span id="startBackendSetupLabel">Start Backend Setup</span>
-                </button>
-
                 <button type="submit" name="accept_order" class="btn btn-accent" style="padding: 16px 32px; font-size: 15px;"
-                        onclick="return confirm('Mark this order ACTIVE and provision the panel?\n\nThis flips user_panels.status from pending → active. Only confirm after you have:\n\n  • Saved every backend / frontend / DB credential\n  • Run the Start Backend Setup installer (or you intend to set it up manually)\n  • Verified DNS points at the reverse proxy\n\nContinue?');">
+                        onclick="return confirm('Mark this order ACTIVE and provision the panel?\n\nThis flips user_panels.status from pending → active. Only confirm after you have:\n\n  • Saved every backend / frontend / DB credential\n  • Verified DNS points at the reverse proxy\n  • Run the backend installer from manage_panel.php (or set it up manually)\n\nContinue?');">
                     <i class="fa-solid fa-check-double"></i> Provision & Accept Order
                 </button>
             </div>
@@ -525,7 +508,6 @@ document.addEventListener('DOMContentLoaded', () => {
             clearTimeout(timeoutId);
             indicator.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving draft...';
             indicator.style.color = 'var(--text-muted)';
-            refreshSetupButton(false); // require fresh save before the button re-enables
 
             timeoutId = setTimeout(() => {
                 const formData = new FormData(form);
@@ -537,7 +519,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     if(data.success) {
                         indicator.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i> Draft saved';
                         indicator.style.color = 'var(--accent-green)';
-                        refreshSetupButton(true); // saved → re-evaluate fields
                     } else {
                         indicator.innerHTML = '<i class="fa-solid fa-circle-xmark"></i> Save failed';
                         indicator.style.color = 'var(--accent-red)';
@@ -550,110 +531,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }, 1000); // 1 second debounce
         });
     }
-
-    // ---------------------------------------------------------------------
-    // "Start Backend Setup" button
-    // ---------------------------------------------------------------------
-    // Enabled only when every required panel-detail field is non-empty AND
-    // the latest autosave has succeeded (so the server actually has the
-    // values we're about to use over SSH).
-    //
-    // Required fields list mirrors admin/setup_backend.php's check.
-    // ---------------------------------------------------------------------
-    const REQUIRED_FIELDS = [
-        'be_server_ip', 'be_ssh_user', 'be_ssh_pass', 'be_service',
-        'be_git_url',
-        'db_server_ip', 'db_name', 'db_user', 'db_pass',
-    ];
-
-    const setupBtn   = document.getElementById('startBackendSetupBtn');
-    const setupLabel = document.getElementById('startBackendSetupLabel');
-    let lastSaveOK = true; // assume saved on initial page render
-
-    function fieldsComplete() {
-        if (!form) return false;
-        for (const name of REQUIRED_FIELDS) {
-            const el = form.elements[name];
-            if (!el) return false;
-            if (!String(el.value || '').trim()) return false;
-        }
-        return true;
-    }
-
-    function refreshSetupButton(savedFresh) {
-        if (typeof savedFresh === 'boolean') lastSaveOK = savedFresh;
-        if (!setupBtn) return;
-
-        const ok = fieldsComplete() && lastSaveOK;
-        setupBtn.disabled = !ok;
-        setupBtn.style.cursor  = ok ? 'pointer' : 'not-allowed';
-        setupBtn.style.opacity = ok ? '1' : '0.55';
-        setupBtn.title = ok
-            ? 'Run apt update → git clone → mvn package → systemd install on the backend host.'
-            : 'Fill every required backend & DB field, then wait for autosave to finish.';
-    }
-
-    if (form && setupBtn) {
-        // Watch every input/select for completeness changes (cheap, throttle if needed).
-        form.addEventListener('input',  () => refreshSetupButton());
-        form.addEventListener('change', () => refreshSetupButton());
-        refreshSetupButton();
-
-        setupBtn.addEventListener('click', async () => {
-            if (setupBtn.disabled) return;
-
-            const confirmMsg =
-                'Start the first-time backend installer for this panel?\n\n' +
-                '• apt update + apt install (git, maven, openjdk-21-jdk)\n' +
-                '• git clone the backend repo\n' +
-                '• mvn clean package -DskipTests (several minutes)\n' +
-                '• write /etc/systemd/system/<service>.service\n' +
-                '• systemctl enable + restart\n\n' +
-                'Total time: 5–10 minutes. Progress streams to the panel terminal.';
-            if (!confirm(confirmMsg)) return;
-
-            const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
-            const panelId = <?= json_encode($order['id'] ?? null) ?>;
-            if (!panelId) { showToast('error', 'Missing panel id.'); return; }
-
-            const original = setupLabel.textContent;
-            setupBtn.disabled = true;
-            setupBtn.style.cursor = 'wait';
-            setupBtn.style.opacity = '0.7';
-            setupLabel.textContent = 'Launching installer…';
-
-            try {
-                const fd = new FormData();
-                fd.append('csrf_token', csrf);
-                fd.append('panel_id', panelId);
-
-                const res = await fetch('setup_backend.php', {
-                    method: 'POST',
-                    headers: { 'X-CSRF-Token': csrf },
-                    body: fd
-                });
-                const data = await res.json();
-
-                if (data.success) {
-                    showToast('success', data.message || 'Installer started.');
-                    setupLabel.textContent = 'Installer running…';
-                    // Hand off to manage_panel where the live log lives.
-                    setTimeout(() => {
-                        window.location.href = data.manage_url || ('manage_panel.php?id=' + panelId);
-                    }, 1200);
-                } else {
-                    showToast('error', data.message || 'Could not start installer.');
-                    setupLabel.textContent = original;
-                    refreshSetupButton(true);
-                }
-            } catch (err) {
-                showToast('error', 'Network error launching installer.');
-                setupLabel.textContent = original;
-                refreshSetupButton(true);
-            }
-        });
-    }
 });
+// NOTE: backend installer ("Start Backend Setup") was moved to
+// admin/manage_panel.php → Backend Engine card → "Create Backend".
 </script>
 </body>
 </html>
