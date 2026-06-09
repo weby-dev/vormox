@@ -21,6 +21,75 @@ $panel_id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
 if (!$panel_id) { header("Location: panels.php"); exit; }
 
 $success = ''; $error = '';
+require_once '../includes/notifications.php';
+
+// --- HANDLE: GENERATE NEXT-MONTH RENEWAL INVOICE ---
+// Creates one Unpaid 'renew' invoice for this panel covering the next billing
+// cycle. Refuses to create a duplicate if an Unpaid invoice already exists
+// for the panel (same guard as admin/edit-user.php bulk_generate_invoices).
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['generate_invoice'])) {
+    try {
+        // Load the panel + user we need for the invoice and the email
+        $loadStmt = $pdo->prepare("
+            SELECT p.user_id, p.domain, p.total_price, p.billing_cycle, p.expiry_date,
+                   u.email, u.first_name
+              FROM user_panels p
+              JOIN users u ON u.id = p.user_id
+             WHERE p.id = ? LIMIT 1
+        ");
+        $loadStmt->execute([$panel_id]);
+        $row = $loadStmt->fetch();
+
+        if (!$row) {
+            $error = "Panel not found.";
+        } else {
+            // Block dup invoices
+            $dupStmt = $pdo->prepare("SELECT id FROM invoices WHERE panel_id = ? AND status = 'Unpaid' LIMIT 1");
+            $dupStmt->execute([$panel_id]);
+            if ($dupStmt->fetch()) {
+                $error = "This panel already has an Unpaid invoice — pay or cancel it before generating another.";
+            } else {
+                $invoice_num = 'INV-' . strtoupper(substr(bin2hex(random_bytes(3)), 0, 6));
+                $amount      = (float) ($row['total_price'] ?: 0);
+                $due_date    = date('Y-m-d', strtotime('+3 days'));
+
+                $cycle  = $row['billing_cycle'] ?? 'monthly';
+                $expiry = $row['expiry_date'];
+
+                // Period = next cycle starting from current expiry (or now if expired)
+                $base_time = (empty($expiry) || strtotime($expiry) < time()) ? time() : strtotime($expiry);
+                $months    = 1;
+                if ($cycle === 'quarterly')                          $months = 3;
+                if ($cycle === 'semi_annually')                      $months = 6;
+                if ($cycle === 'yearly' || $cycle === 'annually')    $months = 12;
+                $period_start = date('Y-m-d', $base_time);
+                $period_end   = date('Y-m-d', strtotime("+{$months} months", $base_time));
+
+                $pdo->prepare("
+                    INSERT INTO invoices (user_id, panel_id, invoice_number, amount, type, status,
+                                          due_date, period_start, period_end, created_at)
+                    VALUES (?, ?, ?, ?, 'renew', 'Unpaid', ?, ?, ?, NOW())
+                ")->execute([$row['user_id'], $panel_id, $invoice_num, $amount, $due_date, $period_start, $period_end]);
+
+                // Notify the customer
+                notify_invoice_created(
+                    $row['email'],
+                    $row['first_name'],
+                    $invoice_num,
+                    $amount,
+                    $due_date,
+                    "Renewal invoice for <strong>" . htmlspecialchars($row['domain'], ENT_QUOTES) . "</strong> covering "
+                    . date('M j, Y', strtotime($period_start)) . " — " . date('M j, Y', strtotime($period_end)) . "."
+                );
+
+                $success = "Renewal invoice {$invoice_num} created for $" . number_format($amount, 2)
+                         . " ({$period_start} → {$period_end}). The customer has been emailed.";
+            }
+        }
+    } catch (PDOException $e) {
+        $error = "Database error generating invoice.";
+    }
+}
 
 // --- HANDLE FULL CONFIGURATION UPDATE ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_panel_config'])) {
@@ -304,11 +373,32 @@ $page_title = 'Manage: ' . $panel['domain'];
   <div class="content-area">
     <a href="panels.php" class="btn-back"><i class="fa-solid fa-arrow-left"></i> Back to Panels</a>
 
+    <?php if ($success): ?>
+        <div style="margin: 0 0 20px 0; padding: 14px 18px; background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.25); border-radius: 10px; color: var(--accent-green); display: flex; align-items: center; gap: 10px;">
+            <i class="fa-solid fa-circle-check"></i> <?= htmlspecialchars($success) ?>
+        </div>
+    <?php endif; ?>
+    <?php if ($error): ?>
+        <div style="margin: 0 0 20px 0; padding: 14px 18px; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.25); border-radius: 10px; color: var(--accent-red); display: flex; align-items: center; gap: 10px;">
+            <i class="fa-solid fa-circle-exclamation"></i> <?= htmlspecialchars($error) ?>
+        </div>
+    <?php endif; ?>
+
     <div class="top-grid">
         <div class="card">
             <div class="card-title">
                 <div><i class="fa-solid fa-globe" style="color: var(--accent2);"></i> Panel Information</div>
-                <button class="btn-edit-config" onclick="openConfigModal()"><i class="fa-solid fa-pen-to-square"></i> Edit Config</button>
+                <div style="display: flex; gap: 8px;">
+                    <form method="POST" action="manage_panel.php?id=<?= (int)$panel_id ?>" style="margin: 0;"
+                          onsubmit="return confirm('Generate the next renewal invoice for this panel?\n\nThe customer will be emailed and the invoice will appear in their billing area.');">
+                        <?= csrf_field() ?>
+                        <input type="hidden" name="generate_invoice" value="1">
+                        <button type="submit" class="btn-edit-config" style="background: rgba(34,211,238,0.1); color: var(--accent-green); border-color: rgba(34,211,238,0.3);">
+                            <i class="fa-solid fa-file-invoice-dollar"></i> Generate Next Invoice
+                        </button>
+                    </form>
+                    <button class="btn-edit-config" onclick="openConfigModal()"><i class="fa-solid fa-pen-to-square"></i> Edit Config</button>
+                </div>
             </div>
             <div class="data-row"><span class="data-label">Domain</span><span class="data-value"><?= htmlspecialchars($panel['domain']) ?></span></div>
             <div class="data-row"><span class="data-label">Client Name</span><span class="data-value"><?= htmlspecialchars($panel['first_name'] . ' ' . $panel['last_name']) ?></span></div>

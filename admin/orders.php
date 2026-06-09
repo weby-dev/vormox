@@ -364,7 +364,14 @@ $page_title = 'Order Management';
 
         <a href="orders.php" class="btn btn-back"><i class="fa-solid fa-arrow-left"></i> Back to Orders</a>
         
-        <form method="POST" action="orders.php" class="card" id="fulfillForm"><?= csrf_field() ?>
+        <!--
+            onkeydown blocks the browser's default "Enter inside a text input
+            with a single submit button auto-submits the form" behavior. Without
+            this, hitting Enter to tab between fields would accidentally fire
+            the accept_order handler and provision the panel.
+        -->
+        <form method="POST" action="orders.php" class="card" id="fulfillForm"
+              onkeydown="if (event.key === 'Enter' && event.target.tagName !== 'TEXTAREA') { event.preventDefault(); return false; }"><?= csrf_field() ?>
             <input type="hidden" name="panel_id" value="<?= htmlspecialchars($order['id']) ?>">
             
             <div class="card-title" style="justify-content: space-between;">
@@ -457,7 +464,8 @@ $page_title = 'Order Management';
                     <span id="startBackendSetupLabel">Start Backend Setup</span>
                 </button>
 
-                <button type="submit" name="accept_order" class="btn btn-accent" style="padding: 16px 32px; font-size: 15px;">
+                <button type="submit" name="accept_order" class="btn btn-accent" style="padding: 16px 32px; font-size: 15px;"
+                        onclick="return confirm('Mark this order ACTIVE and provision the panel?\n\nThis flips user_panels.status from pending → active. Only confirm after you have:\n\n  • Saved every backend / frontend / DB credential\n  • Run the Start Backend Setup installer (or you intend to set it up manually)\n  • Verified DNS points at the reverse proxy\n\nContinue?');">
                     <i class="fa-solid fa-check-double"></i> Provision & Accept Order
                 </button>
             </div>

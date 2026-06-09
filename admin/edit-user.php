@@ -527,7 +527,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-settings" class="tab-pane <?= $active_tab == 'settings' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= (int)$user_id ?>" class="card"><?= csrf_field() ?>
             
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-user" style="color: var(--accent); margin-right: 8px;"></i> Core Account Settings</div>
@@ -638,7 +638,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-panels" class="tab-pane <?= $active_tab == 'panels' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= (int)$user_id ?>" class="card"><?= csrf_field() ?>
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-server" style="color: var(--accent); margin-right: 8px;"></i> Client Infrastructure</div>
                 <div>
@@ -697,7 +697,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     </div>
 
     <div id="tab-invoices" class="tab-pane <?= $active_tab == 'invoices' ? 'active' : '' ?>">
-        <form method="POST" action="edit-user.php?id=<?= $user_id ?><?= csrf_field() ?>" class="card">
+        <form method="POST" action="edit-user.php?id=<?= (int)$user_id ?>" class="card"><?= csrf_field() ?>
             <div class="card-title">
                 <div style="color: var(--text);"><i class="fa-solid fa-file-invoice-dollar" style="color: var(--accent-green); margin-right: 8px;"></i> Billing History</div>
                 <div style="display: flex; align-items: center;">
