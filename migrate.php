@@ -68,8 +68,17 @@ if ($showStatusOnly) {
     exit(0);
 }
 
+// MySQL error codes that mean "the state this DDL was trying to create
+// already exists" — safe to mark the migration as applied and move on.
+// Anything outside this list is treated as a real failure.
+//   1050 — table already exists
+//   1060 — duplicate column name
+//   1061 — duplicate key name
+//   1091 — can't drop; column/index doesn't exist
+const TOLERABLE_DDL_CODES = [1050, 1060, 1061, 1091];
+
 // ----- Apply pending migrations -----
-$ran = 0; $failed = 0;
+$ran = 0; $reconciled = 0; $failed = 0;
 foreach ($files as $f) {
     $name = basename($f);
     if (isset($appliedSet[$name])) continue;
@@ -81,38 +90,58 @@ foreach ($files as $f) {
         continue;
     }
 
+    // DDL on MySQL is auto-committed, so wrapping in BEGIN/COMMIT doesn't
+    // actually let us roll back a half-finished ALTER. Run it straight and
+    // classify the result.
+    $ddl_ok       = false;
+    $ddl_already  = false;
+    $ddl_err      = null;
     try {
-        $pdo->beginTransaction();
-
-        // PDO::exec runs the whole script; many DDL statements implicitly
-        // commit on MySQL, but we still bracket logical work in a transaction
-        // so the ledger update either succeeds with the migration or we know
-        // we have a partial state to investigate.
         $pdo->exec($sql);
-
-        $ins = $pdo->prepare("INSERT INTO schema_migrations (filename) VALUES (?)");
-        $ins->execute([$name]);
-
-        $pdo->commit();
-        echo "ok\n";
-        $ran++;
+        $ddl_ok = true;
     } catch (PDOException $e) {
-        if ($pdo->inTransaction()) {
-            try { $pdo->rollBack(); } catch (Throwable $_) {}
+        $code = isset($e->errorInfo[1]) ? (int) $e->errorInfo[1] : 0;
+        if (in_array($code, TOLERABLE_DDL_CODES, true)) {
+            // The schema already matches what this migration would create.
+            // Record it as applied — the desired end-state is what matters.
+            $ddl_already = true;
+        } else {
+            $ddl_err = $e->getMessage();
         }
+    }
+
+    if ($ddl_ok || $ddl_already) {
+        try {
+            $pdo->prepare("INSERT INTO schema_migrations (filename) VALUES (?)")->execute([$name]);
+            if ($ddl_already) {
+                echo "reconciled (schema already matched)\n";
+                $reconciled++;
+            } else {
+                echo "ok\n";
+                $ran++;
+            }
+        } catch (PDOException $e) {
+            echo "FAILED to record in schema_migrations\n";
+            fwrite(STDERR, "  {$e->getMessage()}\n");
+            $failed++;
+            break;
+        }
+    } else {
         echo "FAILED\n";
-        fwrite(STDERR, "  {$e->getMessage()}\n");
+        fwrite(STDERR, "  {$ddl_err}\n");
         $failed++;
-        break; // stop on first failure so later migrations don't apply against an inconsistent state
+        break; // stop on first real failure so we don't apply later migrations against an inconsistent schema
     }
 }
 
-if ($ran === 0 && $failed === 0) {
+if ($ran === 0 && $reconciled === 0 && $failed === 0) {
     echo "Nothing to do — schema is up to date.\n";
 } else {
-    echo "Applied {$ran} migration(s)";
-    if ($failed > 0) echo ", {$failed} failed";
-    echo ".\n";
+    $parts = [];
+    if ($ran        > 0) $parts[] = "{$ran} applied";
+    if ($reconciled > 0) $parts[] = "{$reconciled} reconciled";
+    if ($failed     > 0) $parts[] = "{$failed} failed";
+    echo implode(", ", $parts) . ".\n";
 }
 
 exit($failed > 0 ? 1 : 0);
