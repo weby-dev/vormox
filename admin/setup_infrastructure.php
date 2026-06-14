@@ -69,9 +69,11 @@ if (!$panel) {
     echo json_encode(['success' => false, 'message' => 'Panel not found.']); exit;
 }
 
-// --- We need the BACKEND IP to call its API; everything else is per-type. ---
-if (empty($panel['be_server_ip'])) {
-    echo json_encode(['success' => false, 'message' => 'Backend IP is missing — cannot reach /internal/api/liveservers.']);
+// The internal-api endpoint refuses any request whose source IP isn't
+// 127.0.0.1 — so we SSH into the backend and run `curl` from there. That
+// requires BE SSH credentials in addition to the BE server IP.
+if (empty($panel['be_server_ip']) || empty($panel['be_ssh_user']) || empty($panel['be_ssh_pass'])) {
+    echo json_encode(['success' => false, 'message' => 'Backend SSH credentials (IP + user + password) are required to register infrastructure — the API only accepts localhost calls so we have to invoke it from the backend host itself.']);
     exit;
 }
 
@@ -81,7 +83,8 @@ if ($secret === '') {
     exit;
 }
 
-$api_url = sprintf('http://%s:8080/internal/api/liveservers', $panel['be_server_ip']);
+$be_ssh_port = (int) ($panel['be_ssh_port'] ?: 22);
+$api_url     = 'http://127.0.0.1:8080/internal/api/liveservers'; // called from the backend's own shell
 
 // --- Map panel_details columns → API payload per server type ---
 $specs = [
@@ -108,15 +111,44 @@ $specs = [
     ],
 ];
 
-// --- Fire all three calls and collect per-type results ---
+// --- Open ONE SSH session to the backend; reuse it for all three calls ---
+if (!function_exists('ssh2_connect')) {
+    echo json_encode(['success' => false, 'message' => 'PHP ssh2 extension missing on web server.']);
+    exit;
+}
+$errno = 0; $errstr = '';
+$probe = @stream_socket_client("tcp://{$panel['be_server_ip']}:{$be_ssh_port}", $errno, $errstr, 5);
+if (!$probe) {
+    echo json_encode(['success' => false, 'message' => "Backend host unreachable: {$panel['be_server_ip']}:{$be_ssh_port} ({$errstr})"]);
+    exit;
+}
+fclose($probe);
+
+$conn = @ssh2_connect($panel['be_server_ip'], $be_ssh_port);
+if (!$conn) {
+    echo json_encode(['success' => false, 'message' => 'SSH handshake to backend failed.']);
+    exit;
+}
+if (!@ssh2_auth_password($conn, $panel['be_ssh_user'], $panel['be_ssh_pass'])) {
+    echo json_encode(['success' => false, 'message' => 'SSH authentication to backend failed.']);
+    exit;
+}
+
+// Run each curl from the backend's own shell so the source IP is 127.0.0.1.
+// The JSON payload is shipped via base64 to dodge all the shell-quoting
+// headaches that arise from passwords containing $, !, ", etc.
+$header_secret = escapeshellarg("X-Internal-Secret: {$secret}");
+$header_json   = escapeshellarg("Content-Type: application/json");
+$url_arg       = escapeshellarg($api_url);
+
 $results = [];
 $ok = 0; $skipped = 0; $failed = 0;
 
 foreach ($specs as $type => $cfg) {
     if (empty($cfg['serverIp']) || empty($cfg['username']) || empty($cfg['password'])) {
         $results[$type] = [
-            'status'  => 'skipped',
-            'reason'  => 'Missing IP / SSH user / SSH password in panel_details.',
+            'status' => 'skipped',
+            'reason' => 'Missing IP / SSH user / SSH password in panel_details.',
         ];
         $skipped++;
         continue;
@@ -130,32 +162,45 @@ foreach ($specs as $type => $cfg) {
         'password'   => $cfg['password'],
         'sshPort'    => $cfg['sshPort'],
         'isActive'   => true,
-    ]);
+    ], JSON_UNESCAPED_SLASHES);
 
-    $ch = curl_init($api_url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $payload,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_HTTPHEADER     => [
-            'Content-Type: application/json',
-            'X-Internal-Secret: ' . $secret,
-        ],
-    ]);
-    $body = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $err  = curl_error($ch);
-    curl_close($ch);
+    $payload_b64 = base64_encode($payload);
 
-    if ($err) {
-        $results[$type] = ['status' => 'error', 'reason' => "cURL: {$err}"];
+    // base64 → curl --data-binary @- → trailing marker captures the HTTP code
+    // so PHP can split body and status cleanly.
+    $cmd = "printf %s '{$payload_b64}' | base64 -d | "
+         . "curl -s -m 15 --connect-timeout 5 "
+         . "-X POST {$url_arg} "
+         . "-H {$header_json} "
+         . "-H {$header_secret} "
+         . "--data-binary @- "
+         . "-w '\\n---HTTP=%{http_code}'";
+
+    $stream = @ssh2_exec($conn, $cmd);
+    if (!$stream) {
+        $results[$type] = ['status' => 'error', 'reason' => 'SSH exec failed (could not start curl on backend).'];
+        $failed++;
+        continue;
+    }
+    stream_set_blocking($stream, true);
+    stream_set_timeout($stream, 25);
+    $output = (string) @stream_get_contents(@ssh2_fetch_stream($stream, SSH2_STREAM_STDIO));
+    @fclose($stream);
+
+    // Parse "BODY\n---HTTP=NNN" — fall back to whole string + unknown code
+    $body = $output;
+    $code = 0;
+    if (preg_match('/^(.*?)\n?---HTTP=(\d+)\s*$/s', $output, $m)) {
+        $body = $m[1];
+        $code = (int) $m[2];
+    }
+
+    if ($code === 0) {
+        $results[$type] = ['status' => 'error', 'reason' => 'No response from backend curl. Output: ' . trim($body)];
         $failed++;
     } elseif ($code < 200 || $code >= 300) {
         $msg = "HTTP {$code}";
-        // Try to surface the backend's JSON error message if there is one
-        $decoded = @json_decode($body, true);
+        $decoded = @json_decode(trim($body), true);
         if (is_array($decoded) && !empty($decoded['error']))   $msg .= " — " . $decoded['error'];
         if (is_array($decoded) && !empty($decoded['message'])) $msg .= " — " . $decoded['message'];
         $results[$type] = ['status' => 'error', 'reason' => $msg];

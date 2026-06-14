@@ -10,4 +10,4 @@ tmp/
 *.zip
 *.tar.gz
 *.bak
-
+.env
