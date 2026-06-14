@@ -287,16 +287,22 @@ ensure_tools
 send_email() {
     local subject="\$1"
     local htmlbody="\$2"
-    local attachment_b64="\${3:-}"
+    local attachment_file="\${3:-}"   # PATH to the file (NOT base64) — python reads it
     local attachment_name="\${4:-}"
 
     local payload_file
     payload_file=\$(mktemp /tmp/vormox_zepto.XXXXXX.json)
 
-    # Use python3 for safe JSON encoding (handles every special char correctly).
-    # Falls back to a minimal sed-escape if python3 isn't available.
+    # Build the JSON with python3, which reads the (possibly large) attachment
+    # straight from disk and base64-encodes it itself. Only small values pass
+    # through the environment, so we never hit E2BIG ("Argument list too long")
+    # no matter how big the dump is.
     if command -v python3 >/dev/null 2>&1; then
-        python3 - "\$payload_file" <<PYEOF
+        FROM_EMAIL="\$FROM_EMAIL" FROM_NAME="\$FROM_NAME" \\
+        SUBJECT="\$subject" HTMLBODY="\$htmlbody" \\
+        ATTACHMENT_NAME="\$attachment_name" ATTACHMENT_FILE="\$attachment_file" \\
+        TO_RECIPIENTS_B64="\$TO_RECIPIENTS_B64" \\
+        python3 - "\$payload_file" <<'PYEOF'
 import json, os, sys, base64
 payload_file = sys.argv[1]
 to_list = json.loads(base64.b64decode(os.environ["TO_RECIPIENTS_B64"]))
@@ -306,47 +312,37 @@ out = {
     "subject":  os.environ["SUBJECT"],
     "htmlbody": os.environ["HTMLBODY"],
 }
-att = os.environ.get("ATTACHMENT_B64", "")
-if att:
-    out["attachments"] = [{
-        "content":   att,
-        "mime_type": "application/x-xz",
-        "name":      os.environ["ATTACHMENT_NAME"],
-    }]
+att_file = os.environ.get("ATTACHMENT_FILE", "")
+if att_file and os.path.isfile(att_file):
+    with open(att_file, "rb") as f:
+        out["attachments"] = [{
+            "content":   base64.b64encode(f.read()).decode(),
+            "mime_type": "application/x-xz",
+            "name":      os.environ.get("ATTACHMENT_NAME", "backup.sql.xz"),
+        }]
 with open(payload_file, "w") as f:
     json.dump(out, f)
 PYEOF
     else
-        # Minimal fallback — covers most cases but won't survive curly braces in subject.
+        # No python3 → send the notification WITHOUT the attachment (small + safe).
+        # The S3 copy is the source of truth anyway.
         local s_esc h_esc
         s_esc=\$(printf '%s' "\$subject"  | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
         h_esc=\$(printf '%s' "\$htmlbody" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g' | tr '\n' ' ')
         {
             printf '{"from":{"address":"%s","name":"%s"},' "\$FROM_EMAIL" "\$FROM_NAME"
             printf '"to":%s,' "\$(echo "\$TO_RECIPIENTS_B64" | base64 -d)"
-            printf '"subject":"%s","htmlbody":"%s"' "\$s_esc" "\$h_esc"
-            if [[ -n "\$attachment_b64" ]]; then
-                printf ',"attachments":[{"content":"%s","mime_type":"application/x-xz","name":"%s"}]' \\
-                    "\$attachment_b64" "\$attachment_name"
-            fi
-            printf '}'
+            printf '"subject":"%s","htmlbody":"%s"}' "\$s_esc" "\$h_esc"
         } > "\$payload_file"
     fi
 
-    SUBJECT="\$subject" HTMLBODY="\$htmlbody" \\
-    ATTACHMENT_B64="\$attachment_b64" ATTACHMENT_NAME="\$attachment_name" \\
-    TO_RECIPIENTS_B64="\$TO_RECIPIENTS_B64" \\
-    FROM_EMAIL="\$FROM_EMAIL" FROM_NAME="\$FROM_NAME" \\
-    : # vars now exported into Python's env via the `XYZ=val python3 ...` pattern handled above
-
-    local resp http
-    resp=\$(curl -s -o /dev/null -w '%{http_code}' \\
+    local http
+    http=\$(curl -s -o /dev/null -w '%{http_code}' \\
         -X POST "https://api.zeptomail.in/v1.1/email" \\
         -H "Accept: application/json" \\
         -H "Content-Type: application/json" \\
         -H "Authorization: \${ZEPTO_API_KEY}" \\
         --data-binary "@\${payload_file}")
-    http="\$resp"
 
     rm -f "\$payload_file"
 
@@ -359,16 +355,11 @@ PYEOF
     fi
 }
 
-# Export so the Python block can see them
-export TO_RECIPIENTS_B64 FROM_EMAIL FROM_NAME
-
 on_error() {
     local err="\$1"
     log "ERROR: \$err"
-    SUBJECT="❌ Backup FAILED — \$DB_NAME (\$DOMAIN)" \\
-    HTMLBODY="<h3>Backup Failed</h3><p><b>Database:</b> \$DB_NAME</p><p><b>Domain:</b> \$DOMAIN</p><p><b>Host:</b> \$HOSTNAME_TXT</p><p><b>Time:</b> \$TIMESTAMP</p><p><b>Error:</b> \$err</p>" \\
     send_email "❌ Backup FAILED — \$DB_NAME (\$DOMAIN)" \\
-        "<h3>Backup Failed</h3><p><b>Database:</b> \$DB_NAME</p><p><b>Domain:</b> \$DOMAIN</p><p><b>Time:</b> \$TIMESTAMP</p><p><b>Error:</b> \$err</p>" || true
+        "<h3>Backup Failed</h3><p><b>Database:</b> \$DB_NAME</p><p><b>Domain:</b> \$DOMAIN</p><p><b>Host:</b> \$HOSTNAME_TXT</p><p><b>Time:</b> \$TIMESTAMP</p><p><b>Error:</b> \$err</p>" || true
     rm -f "\$RAW_FILE" "\$BACKUP_FILE"
     exit 1
 }
@@ -472,16 +463,13 @@ EMAIL_BODY="<h3>✅ Database Backup Successful</h3>
 
 if (( FINAL_SIZE_BYTES <= MAX_EMAIL_BYTES )); then
     log "File fits — attaching and sending..."
-    ATTACHMENT_B64=\$(base64 -w 0 "\$BACKUP_FILE")
     ATTACHMENT_NAME=\$(basename "\$BACKUP_FILE")
-    SUBJECT="✅ DB Backup — \$DOMAIN — \$TIMESTAMP" HTMLBODY="\$EMAIL_BODY" \\
-    ATTACHMENT_B64="\$ATTACHMENT_B64" ATTACHMENT_NAME="\$ATTACHMENT_NAME" \\
-    send_email "✅ DB Backup — \$DOMAIN — \$TIMESTAMP" "\$EMAIL_BODY" "\$ATTACHMENT_B64" "\$ATTACHMENT_NAME" \\
+    # Pass the FILE PATH (not base64) — python reads + encodes it from disk.
+    send_email "✅ DB Backup — \$DOMAIN — \$TIMESTAMP" "\$EMAIL_BODY" "\$BACKUP_FILE" "\$ATTACHMENT_NAME" \\
         || on_error "ZeptoMail send (with attachment) failed"
 else
-    log "File too large (\$FINAL_SIZE > 14MB) — sending notice only."
-    NOTE="\$EMAIL_BODY<hr><p><b>⚠️ File too large to attach (\$FINAL_SIZE).</b></p><p><b>Server path:</b> <code>\$BACKUP_FILE</code></p><p>Pull via SCP/SFTP or set up cloud storage upload.</p>"
-    SUBJECT="⚠️ DB Backup created (too large) — \$DOMAIN — \$TIMESTAMP" HTMLBODY="\$NOTE" \\
+    log "File too large (\$FINAL_SIZE > 14MB) — sending notice only (S3 copy retained)."
+    NOTE="\$EMAIL_BODY<hr><p><b>⚠️ File too large to attach (\$FINAL_SIZE).</b></p><p>The full backup is stored in S3 — download it from the Vormox dashboard.</p>"
     send_email "⚠️ DB Backup created (too large) — \$DOMAIN — \$TIMESTAMP" "\$NOTE" \\
         || on_error "ZeptoMail send (notice) failed"
 fi

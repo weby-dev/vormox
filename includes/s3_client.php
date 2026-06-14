@@ -66,6 +66,13 @@ if (!function_exists('s3_cfg')) {
         return $out;
     }
 
+    /** Extract the first <tag>…</tag> inner text from an XML fragment (no extension needed). */
+    function s3_xml_tag(string $xml, string $tag): ?string {
+        $t = preg_quote($tag, '#');
+        if (preg_match('#<' . $t . '\b[^>]*>(.*?)</' . $t . '>#s', $xml, $mm)) return $mm[1];
+        return null;
+    }
+
     /** Derive the SigV4 signing key (raw binary). */
     function s3_signing_key(string $secret, string $date, string $region, string $service = 's3'): string {
         $kDate    = hash_hmac('sha256', $date, 'AWS4' . $secret, true);
@@ -204,17 +211,20 @@ if (!function_exists('s3_cfg')) {
             $out['error'] = $res['error'] ?: trim($res['body']);
             return $out;
         }
-        $xml = @simplexml_load_string($res['body']);
-        if ($xml === false) { $out['error'] = 'Could not parse S3 list XML.'; return $out; }
-        foreach ($xml->Contents as $c) {
-            $out['objects'][] = [
-                'key'      => (string) $c->Key,
-                'size'     => (int) $c->Size,
-                'modified' => (string) $c->LastModified,
-            ];
+        // Parse without any XML extension — prod PHP may lack ext-simplexml/dom.
+        if (preg_match_all('#<Contents>(.*?)</Contents>#s', $res['body'], $m)) {
+            foreach ($m[1] as $block) {
+                $key = s3_xml_tag($block, 'Key');
+                if ($key === null) continue;
+                $out['objects'][] = [
+                    'key'      => html_entity_decode($key, ENT_QUOTES | ENT_XML1, 'UTF-8'),
+                    'size'     => (int) (s3_xml_tag($block, 'Size') ?? 0),
+                    'modified' => (string) (s3_xml_tag($block, 'LastModified') ?? ''),
+                ];
+            }
         }
-        if (isset($xml->IsTruncated) && (string) $xml->IsTruncated === 'true') {
-            $out['next'] = (string) $xml->NextContinuationToken;
+        if (s3_xml_tag($res['body'], 'IsTruncated') === 'true') {
+            $out['next'] = s3_xml_tag($res['body'], 'NextContinuationToken');
         }
         $out['ok'] = true;
         return $out;
@@ -231,6 +241,39 @@ if (!function_exists('s3_cfg')) {
             'size'   => $exists ? (int) ($res['headers']['content-length'] ?? 0) : 0,
             'status' => $res['status'],
         ];
+    }
+
+    /**
+     * Stream an object to the browser THROUGH this server, so the S3 endpoint is
+     * never exposed to the client (the presigned URL is used server-side only).
+     * Sets attachment headers and pipes the bytes. Returns false if not found.
+     */
+    function s3_stream_to_browser(string $key, string $downloadName): bool {
+        if (!s3_configured()) { http_response_code(500); return false; }
+        $head = s3_head($key);
+        if (!$head['exists']) { http_response_code(404); return false; }
+
+        $name = str_replace(['"', "\r", "\n"], '', $downloadName !== '' ? $downloadName : basename($key));
+        header('Content-Type: application/x-xz');
+        header('Content-Disposition: attachment; filename="' . $name . '"');
+        header('X-Content-Type-Options: nosniff');
+        if ($head['size'] > 0) header('Content-Length: ' . $head['size']);
+        while (ob_get_level() > 0) { ob_end_flush(); }
+
+        $url = s3_presign_get($key, 120);   // server-side only — never reaches the client
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => false,
+            CURLOPT_HEADER         => false,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_FAILONERROR    => true,   // don't stream an S3 error body as if it were the file
+            CURLOPT_TIMEOUT        => 600,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_WRITEFUNCTION  => function ($ch, $data) { echo $data; flush(); return strlen($data); },
+        ]);
+        $ok = curl_exec($ch);
+        curl_close($ch);
+        return $ok !== false;
     }
 
     /** DELETE one object. Returns ['ok','status','error']. */

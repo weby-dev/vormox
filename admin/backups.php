@@ -19,11 +19,12 @@ if (!isset($_SESSION['admin_id']) || $_SESSION['admin_logged_in'] !== true) { he
 
 csrf_require();   // enforces token on POST; no-op on GET
 
-// --- ACTION: download (admin, no OTP) → 302 to a short-lived presigned URL ---
+// --- ACTION: download (admin, no OTP) → stream through this server, so the S3
+//     endpoint is never exposed to the browser (presign is used server-side). ---
 if (($_GET['action'] ?? '') === 'download') {
     $key = (string) ($_GET['key'] ?? '');
     if ($key === '' || !s3_configured()) { http_response_code(400); exit('Bad request.'); }
-    header('Location: ' . s3_presign_get($key, 120, backup_download_name($key)));
+    s3_stream_to_browser($key, backup_download_name($key));
     exit;
 }
 
