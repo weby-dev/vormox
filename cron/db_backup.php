@@ -241,10 +241,48 @@ mkdir -p "\$BACKUP_DIR" "\$(dirname "\$LOG_FILE")"
 
 log() { echo "[\$(date '+%Y-%m-%d %H:%M:%S')] \$1" | tee -a "\$LOG_FILE"; }
 
-# Ensure required tools
-for bin in mysql mysqldump xz curl base64; do
-    command -v "\$bin" >/dev/null 2>&1 || { log "ERROR: '\$bin' not installed"; exit 1; }
-done
+# Ensure required tools — auto-install the missing ones (Debian/Ubuntu) instead
+# of bailing out. First run on a fresh box installs the mysql client etc.
+ensure_tools() {
+    local missing=()
+    local bin
+    for bin in mysql mysqldump xz curl base64; do
+        command -v "\$bin" >/dev/null 2>&1 || missing+=("\$bin")
+    done
+    [[ \${#missing[@]} -eq 0 ]] && return 0
+
+    log "Missing tools: \${missing[*]} — attempting install via apt-get..."
+    export DEBIAN_FRONTEND=noninteractive
+    local APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold'
+    apt-get update -y >>"\$LOG_FILE" 2>&1 || true
+
+    local pkgs=()
+    for bin in "\${missing[@]}"; do
+        case "\$bin" in
+            mysql|mysqldump) pkgs+=("default-mysql-client");;
+            xz)              pkgs+=("xz-utils");;
+            curl)            pkgs+=("curl");;
+            base64)          pkgs+=("coreutils");;
+        esac
+    done
+    local uniq
+    uniq=\$(printf '%s\\n' "\${pkgs[@]}" | sort -u | tr '\\n' ' ')
+    log "Installing: \$uniq"
+    apt-get install -y \$APT_OPTS \$uniq >>"\$LOG_FILE" 2>&1 || true
+
+    local still=()
+    for bin in "\${missing[@]}"; do
+        command -v "\$bin" >/dev/null 2>&1 || still+=("\$bin")
+    done
+    # NOTE: on_error/send_email aren't defined yet at this point in the script,
+    # so fail with a plain log+exit (matching the original tool-check behaviour).
+    if [[ \${#still[@]} -gt 0 ]]; then
+        log "ERROR: required tools still missing after install: \${still[*]}"
+        exit 1
+    fi
+    log "Tools installed OK."
+}
+ensure_tools
 
 send_email() {
     local subject="\$1"
@@ -338,14 +376,37 @@ trap 'on_error "Script terminated unexpectedly at line \$LINENO"' ERR
 
 log "=== Starting backup of \$DB_NAME (\$DOMAIN) ==="
 
-# 1. Pre-flight
+# 1. Pre-flight — resolve a reachable DB host. Some panels' databases only
+#    accept connections from the backend host itself, so if the configured host
+#    is unreachable (or misconfigured) we transparently retry on localhost.
+DB_HOSTS_TRY=("\$DB_HOST")
+if [[ "\$DB_HOST" != "127.0.0.1" && "\$DB_HOST" != "localhost" ]]; then
+    DB_HOSTS_TRY+=("127.0.0.1")
+fi
+RESOLVED_HOST=""
+FIRST_CONNECT=""
+for H in "\${DB_HOSTS_TRY[@]}"; do
+    EXISTS=\$(mysql --host="\$H" --user="\$DB_USER" --password="\$DB_PASS" \\
+          -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='\$DB_NAME';" 2>/dev/null) || continue
+    [[ -z "\$FIRST_CONNECT" ]] && FIRST_CONNECT="\$H"
+    if [[ "\${EXISTS:-0}" -gt 0 ]]; then RESOLVED_HOST="\$H"; break; fi
+done
+if [[ -z "\$RESOLVED_HOST" ]]; then
+    [[ -n "\$FIRST_CONNECT" ]] && on_error "Database '\$DB_NAME' not found on any reachable host (connected to: \$FIRST_CONNECT)"
+    on_error "Cannot connect to MySQL for '\$DB_NAME' (tried: \${DB_HOSTS_TRY[*]})"
+fi
+if [[ "\$RESOLVED_HOST" != "\$DB_HOST" ]]; then
+    log "Configured DB host \$DB_HOST unreachable/missing — using \$RESOLVED_HOST instead"
+    DB_HOST="\$RESOLVED_HOST"
+fi
+
 TABLE_COUNT=\$(mysql --host="\$DB_HOST" --user="\$DB_USER" --password="\$DB_PASS" \\
     -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='\$DB_NAME';" 2>/dev/null) \\
-    || on_error "Cannot connect to MySQL or database '\$DB_NAME' not found at \$DB_HOST"
+    || on_error "Cannot query table list on \$DB_HOST"
 FK_COUNT=\$(mysql --host="\$DB_HOST" --user="\$DB_USER" --password="\$DB_PASS" \\
     -N -B -e "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema='\$DB_NAME';" 2>/dev/null) \\
     || on_error "Cannot query foreign key info"
-log "Database has \$TABLE_COUNT tables and \$FK_COUNT foreign keys"
+log "Database has \$TABLE_COUNT tables and \$FK_COUNT foreign keys (host: \$DB_HOST)"
 
 # 2. Dump (FK/index safe)
 log "Dumping database..."
