@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 *.log
-.env
 venv/
 node_modules/
 *.db
@@ -12,5 +11,3 @@ tmp/
 *.tar.gz
 *.bak
 
-# Secrets live in .env only
-.env

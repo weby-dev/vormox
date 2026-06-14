@@ -9,9 +9,12 @@
 // The admin watches progress live via the existing "Backend Build & Task
 // Progress" channel on manage_panel.php (which tails that same file).
 //
-// While the installer is running, panel_details.be_status is 'installing'.
-// The bash script flips it to 'installed' on success or 'error' on failure
-// via mysql client at the end.
+// PHP sets panel_details.be_status = 'installing' before kickoff. The bash
+// script can't reach the Vormox DB (it only has the customer's credentials),
+// so it drops a marker at /var/log/vormox/<domain>-task.status containing
+// either 'installed' or 'error'. Admins read this from the terminal pane.
+// A future lifecycle cron tick is the right place to reflect this into the
+// Vormox DB if you want automated status transitions.
 
 session_start();
 require_once '../config.php';
@@ -110,7 +113,14 @@ if (!empty($panel['be_git_user'])) {
 
 // --- Build the bash script ---
 $ssh_port = (int) ($panel['be_ssh_port'] ?: 22);
+
+// Normalize the service name. The bash script ALWAYS writes the unit to
+// /etc/systemd/system/<service>.service, so if the admin typed the suffix
+// already (e.g. "somani-one.service") we strip it here — otherwise the
+// file lands at /etc/systemd/system/somani-one.service.service and
+// `systemctl enable somani-one.service` fails to find it.
 $service  = preg_replace('/[^A-Za-z0-9._-]/', '', $panel['be_service']) ?: 'vormox-backend';
+$service  = preg_replace('/\.service$/i', '', $service);
 
 // Render the script. ALL placeholders are substituted PHP-side; nothing inside
 // the heredoc depends on $variable interpolation by bash unless prefixed with
@@ -129,32 +139,31 @@ LOG_DIR="/var/log/vormox"
 LOG="\${LOG_DIR}/\${DOMAIN}-task.log"
 PANEL_ID="{$panel_id}"
 
-mkdir -p "\$LOG_DIR"
+mkdir -p "\$LOG_DIR" /var/lock
 touch "\$LOG"
 chmod 600 "\$LOG"
 
 ts() { date '+[%Y-%m-%d %H:%M:%S]'; }
 log() { echo "\$(ts) \$*" >> "\$LOG"; }
 
+# Concurrency guard. The script touches /root/somaniOne-main which is shared
+# across every backend install on this host — two scripts running at once
+# corrupt the clone. Acquire an exclusive lock on /var/lock/vormox-backend.lock
+# and bail cleanly if a sibling already holds it.
+exec 200>/var/lock/vormox-backend.lock
+if ! flock -n 200; then
+    log "Another backend setup is already running on this host. Exiting."
+    exit 0
+fi
+
 fail() {
     log "FATAL: \$*"
     log "==========================================="
     log "FAILURE: Backend setup aborted for \$DOMAIN"
     log "==========================================="
-    update_status "error"
+    # Drop a marker the admin (or a future lifecycle cron tick) can detect.
+    echo "error" > "/var/log/vormox/\${DOMAIN}-task.status" 2>/dev/null || true
     exit 1
-}
-
-# Update OUR (vormox) database's panel_details.be_status via mysql client.
-update_status() {
-    local new_status="\$1"
-    mysql --connect-timeout=5 \\
-          -h "{$panel['db_server_ip']}" \\
-          -u "{$panel['db_user']}" \\
-          -p"{$panel['db_pass']}" \\
-          --batch --skip-column-names \\
-          -e "UPDATE \\\`{$panel['db_name']}\\\`.panel_details SET be_status='\$new_status' WHERE panel_id=\$PANEL_ID;" \\
-          >>"\$LOG" 2>&1 || log "  (warning: could not update be_status to \$new_status from inside the worker)"
 }
 
 run() {
@@ -171,11 +180,17 @@ log "==========================================="
 
 # -----------------------------------------------------------------
 # Step 1: prerequisites
+# (apt update → apt upgrade → set timezone → install our build deps)
 # -----------------------------------------------------------------
 log ""
-log ">>> Step 1/5: apt update + install prerequisites"
+log ">>> Step 1/5: system prep + install prerequisites"
 export DEBIAN_FRONTEND=noninteractive
+# --force-conf* keeps existing config files instead of prompting on upgrade,
+# which would hang the script under noninteractive mode.
+APT_OPTS='-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold'
 run "apt-get update -y"
+run "apt-get \$APT_OPTS upgrade -y"
+run "timedatectl set-timezone Asia/Kolkata"
 run "apt-get install -y git maven openjdk-21-jdk default-mysql-client"
 
 # -----------------------------------------------------------------
@@ -278,7 +293,7 @@ if [ "\$HEALTHY" -eq 1 ]; then
     log "SUCCESS: Backend setup complete for \$DOMAIN"
     log "Service: \$SERVICE is active"
     log "==========================================="
-    update_status "installed"
+    echo "installed" > "/var/log/vormox/\${DOMAIN}-task.status" 2>/dev/null || true
     exit 0
 else
     log ""
@@ -320,6 +335,26 @@ try {
     $pdo->prepare("UPDATE panel_details SET be_status = 'installing' WHERE panel_id = ?")
         ->execute([$panel_id]);
 } catch (PDOException $e) { /* non-fatal */ }
+
+// Concurrency precheck — `flock -n` exits 1 immediately if the lock is
+// already held. We pre-test so the admin gets a clear "already running"
+// error instead of a silent "Launched" toast for a script that promptly
+// exits. (The bash script also re-acquires the lock as a backup in case
+// the race fires between this test and the kickoff.)
+$precheck = "mkdir -p /var/lock && flock -n /var/lock/vormox-backend.lock -c true && echo OK || echo LOCKED";
+$pstream = @ssh2_exec($conn, $precheck);
+if ($pstream) {
+    stream_set_blocking($pstream, true);
+    $presult = trim((string) @stream_get_contents(@ssh2_fetch_stream($pstream, SSH2_STREAM_STDIO)));
+    @fclose($pstream);
+    if (stripos($presult, 'LOCKED') !== false) {
+        echo json_encode([
+            'success' => false,
+            'message' => 'A backend install is already running on this host. Watch the task log; if it looks stuck, wait a few minutes or remove /var/lock/vormox-backend.lock manually.',
+        ]);
+        exit;
+    }
+}
 
 // Write the script, then nohup it. Detach all stdio so ssh2_exec returns fast.
 $kickoff = "mkdir -p /var/log/vormox && "

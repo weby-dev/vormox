@@ -266,7 +266,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'logs') {
         // showing frontend logs.
         $side = null;
         if ($type === 'be' || $type === 'be_task') { $side = 'be'; }
-        elseif ($type === 'fe')                    { $side = 'fe'; }
+        elseif ($type === 'fe' || $type === 'fe_task') { $side = 'fe'; }
         else {
             echo json_encode(['log' => "Unknown log source: " . htmlspecialchars((string)$type)]); exit;
         }
@@ -281,10 +281,11 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'logs') {
             echo json_encode(['log' => "Configuration error: Missing SSH credentials for " . strtoupper($side) . " server."]); exit;
         }
 
-        if ($type === 'be_task') {
-            // Per-domain build/task log. Adjust path here if your deploy
-            // scripts write to a different location.
-            $task_log = escapeshellarg('/var/log/vormox/' . $panel['domain'] . '-task.log');
+        if ($type === 'be_task' || $type === 'fe_task') {
+            // Per-domain build/task log written by setup_backend.php / setup_frontend.php.
+            // BE side writes to <domain>-task.log; FE side writes to <domain>-fe-task.log.
+            $suffix = ($type === 'fe_task') ? '-fe-task.log' : '-task.log';
+            $task_log = escapeshellarg('/var/log/vormox/' . $panel['domain'] . $suffix);
             $cmd = "sudo tail -n 100 {$task_log} 2>/dev/null || echo 'No task log yet for {$panel['domain']}.'";
         } else {
             if (empty($service)) {

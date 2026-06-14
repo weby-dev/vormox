@@ -388,7 +388,16 @@ $page_title = 'Manage: ' . $panel['domain'];
         <div class="card">
             <div class="card-title">
                 <div><i class="fa-solid fa-globe" style="color: var(--accent2);"></i> Panel Information</div>
-                <div style="display: flex; gap: 8px;">
+                <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                    <!--
+                        Add Infrastructure Servers — registers Backend / Frontend / Reverse Proxy
+                        with the panel's backend at http://<be_ip>:8080/internal/api/liveservers
+                        in one POST per type. Skips a type if its IP/credentials are missing.
+                    -->
+                    <button type="button" id="addInfraBtn" onclick="addInfrastructure(this)" class="btn-edit-config"
+                            style="background: rgba(167,139,250,0.1); color: var(--accent); border-color: rgba(167,139,250,0.3);">
+                        <i class="fa-solid fa-network-wired"></i> Add Infrastructure
+                    </button>
                     <form method="POST" action="manage_panel.php?id=<?= (int)$panel_id ?>" style="margin: 0;"
                           onsubmit="return confirm('Generate the next renewal invoice for this panel?\n\nThe customer will be emailed and the invoice will appear in their billing area.');">
                         <?= csrf_field() ?>
@@ -462,29 +471,43 @@ $page_title = 'Manage: ' . $panel['domain'];
 
         <div class="card">
             <div class="card-title"><i class="fa-solid fa-window-maximize" style="color: #3b82f6;"></i> Frontend Service</div>
-            <?php if($panel['fe_service']): 
-                $feOnline = ($panel['fe_status'] === 'online');
+            <?php
+                $feOnline  = ($panel['fe_status'] === 'online');
                 $feOffline = ($panel['fe_status'] === 'offline');
+                $feHasService = !empty($panel['fe_service']);
             ?>
+
+            <?php if (!empty($panel['fe_server_ip'])): ?>
                 <div class="data-row">
                     <span class="data-label">Current Status</span>
                     <span id="fe-status-badge" class="badge <?= $feOnline ? 'badge-active' : ($feOffline ? 'badge-offline' : 'badge-other') ?>">
                         <?= htmlspecialchars(strtoupper($panel['fe_status'] ?? 'UNKNOWN')) ?>
                     </span>
                 </div>
-                <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['fe_service']) ?></span></div>
+                <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['fe_service'] ?: '— (will be created)') ?></span></div>
                 <div class="data-row"><span class="data-label">Server IP</span><span class="data-value data-mono"><?= htmlspecialchars($panel['fe_server_ip']) ?></span></div>
-                
+
                 <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Daemon Controls</div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-                        <button type="button" onclick="runAction('start', 'fe', this)" class="control-btn btn-start" style="margin: 0;" <?= $feOnline ? 'disabled' : '' ?>><i class="fa-solid fa-play"></i> Start</button>
-                        <button type="button" onclick="runAction('stop', 'fe', this)" class="control-btn btn-stop" style="margin: 0;" <?= $feOffline ? 'disabled' : '' ?>><i class="fa-solid fa-stop"></i> Stop</button>
+                        <button type="button" onclick="runAction('start', 'fe', this)" class="control-btn btn-start" style="margin: 0;" <?= ($feOnline || !$feHasService) ? 'disabled' : '' ?>><i class="fa-solid fa-play"></i> Start</button>
+                        <button type="button" onclick="runAction('stop', 'fe', this)" class="control-btn btn-stop" style="margin: 0;" <?= ($feOffline || !$feHasService) ? 'disabled' : '' ?>><i class="fa-solid fa-stop"></i> Stop</button>
                     </div>
-                    <button type="button" onclick="runAction('restart', 'fe', this)" class="control-btn btn-restart" style="margin-top: 8px;"><i class="fa-solid fa-rotate-right"></i> Restart</button>
+                    <button type="button" onclick="runAction('restart', 'fe', this)" class="control-btn btn-restart" style="margin-top: 8px;" <?= !$feHasService ? 'disabled' : '' ?>><i class="fa-solid fa-rotate-right"></i> Restart</button>
+                </div>
+
+                <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
+                    <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Build &amp; Deployment</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                        <!-- Create Frontend → first-time installer (Node 20 + clone + build + systemd). -->
+                        <button type="button" id="createFrontendBtn" onclick="runFrontendJob('create', this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Frontend</button>
+                        <!-- Update Frontend → pull fresh code, rebuild, restart. -->
+                        <button type="button" onclick="runFrontendJob('update', this)" class="control-btn btn-update" style="margin: 0;" <?= !$feHasService ? 'disabled' : '' ?>><i class="fa-brands fa-git-alt"></i> Update Code</button>
+                    </div>
+                    <button type="button" onclick="runFrontendJob('delete', this)" class="control-btn btn-remove" <?= !$feHasService ? 'disabled' : '' ?>><i class="fa-solid fa-trash-can"></i> Delete Frontend</button>
                 </div>
             <?php else: ?>
-                <div style="color: var(--text-dim); text-align: center; padding: 20px;">No frontend mapped.</div>
+                <div style="color: var(--text-dim); text-align: center; padding: 20px;">No frontend mapped.<br><span style="font-size: 12px;">Fill in the Frontend server IP + SSH credentials via <strong>Edit Config</strong> first.</span></div>
             <?php endif; ?>
         </div>
     </div>
@@ -525,6 +548,7 @@ $page_title = 'Manage: ' . $panel['domain'];
                     
                     <?php if(!empty($panel['fe_server_ip'])): ?>
                         <option value="fe">Frontend Daemon Logs (journalctl)</option>
+                        <option value="fe_task">Frontend Build & Task Progress</option>
                     <?php endif; ?>
                     
                     <?php if(!empty($panel['rp_server_ip'])): ?>
@@ -795,6 +819,111 @@ async function createBackend(btn) {
         }
     } catch (err) {
         showToast('error', 'Network error launching installer.');
+        btn.innerHTML = original;
+        btn.disabled = false;
+    }
+}
+
+// --- ADD INFRASTRUCTURE SERVERS ---
+// Fires admin/setup_infrastructure.php which loops the three server types
+// (BACKEND / FRONTEND / REVERSE_PROXY) and POSTs each to the backend's
+// /internal/api/liveservers endpoint using the X-Internal-Secret header.
+async function addInfrastructure(btn) {
+    const confirmMsg =
+        'Register all three infrastructure servers with this panel\'s backend?\n\n' +
+        '• BACKEND      — uses be_server_ip / be_ssh_*\n' +
+        '• FRONTEND     — uses fe_server_ip / fe_ssh_*\n' +
+        '• REVERSE_PROXY — uses rp_server_ip / rp_ssh_*\n\n' +
+        'Each type is sent in its own HTTP POST. Types with missing IP or\n' +
+        'SSH credentials will be skipped, not failed.';
+    if (!confirm(confirmMsg)) return;
+
+    const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Registering…';
+
+    try {
+        const fd = new FormData();
+        fd.append('csrf_token', csrf);
+        fd.append('panel_id', panelId);
+
+        const res = await fetch('setup_infrastructure.php', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrf },
+            body: fd
+        });
+        const data = await res.json();
+
+        // Build a readable per-type breakdown for the toast
+        const lines = [data.message || 'done'];
+        if (data.results) {
+            for (const [type, r] of Object.entries(data.results)) {
+                const icon = r.status === 'ok'      ? '✓'
+                           : r.status === 'skipped' ? '–'
+                           : '✗';
+                const tail = r.reason ? ` — ${r.reason}` : '';
+                lines.push(`${icon} ${type}${tail}`);
+            }
+        }
+        showToast(data.success ? 'success' : 'error', lines.join('<br>'));
+    } catch (err) {
+        showToast('error', 'Network error while registering infrastructure.');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    }
+}
+
+// --- FRONTEND CREATE / UPDATE / DELETE ---
+// All three call admin/setup_frontend.php which dispatches over SSH to the FE host.
+// The bash worker writes to /var/log/vormox/<domain>-fe-task.log; we auto-switch the
+// terminal pane to "Frontend Build & Task Progress" on success so the admin sees it.
+async function runFrontendJob(action, btn) {
+    const verbs = {
+        create: 'CREATE the frontend (install Node 20, git clone, npm install + build, write systemd unit, start)?',
+        update: 'UPDATE the frontend (stop service, wipe dir, re-clone, re-build, restart)?\n\nAll local code modifications on the FE host will be lost.',
+        delete: 'DELETE the frontend (stop + disable + remove unit + rm -rf /root/GetWebUp)?\n\nThis cannot be undone.'
+    };
+    if (!verbs[action]) return;
+    if (!confirm(verbs[action])) return;
+
+    const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Launching…';
+
+    try {
+        const fd = new FormData();
+        fd.append('csrf_token', csrf);
+        fd.append('panel_id', panelId);
+        fd.append('action', action);
+
+        const res = await fetch('setup_frontend.php', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrf },
+            body: fd
+        });
+        const data = await res.json();
+
+        if (data.success) {
+            showToast('success', data.message || 'Frontend job started.');
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running…';
+            // Auto-switch the terminal to the FE task log so admin sees live output.
+            const logSel = document.getElementById('logSource');
+            if (logSel && Array.from(logSel.options).some(o => o.value === 'fe_task')) {
+                logSel.value = 'fe_task';
+                logSel.dispatchEvent(new Event('change'));
+            }
+            // Delete completes fast — for create/update, the job runs for minutes,
+            // so leave the button in "running" state. Page reload will reset it.
+        } else {
+            showToast('error', data.message || 'Could not start frontend job.');
+            btn.innerHTML = original;
+            btn.disabled = false;
+        }
+    } catch (err) {
+        showToast('error', 'Network error launching frontend job.');
         btn.innerHTML = original;
         btn.disabled = false;
     }
