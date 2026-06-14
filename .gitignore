@@ -11,3 +11,4 @@ tmp/
 *.tar.gz
 *.bak
 .env
+.env.*

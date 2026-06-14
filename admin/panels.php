@@ -234,9 +234,16 @@ $page_title = 'Provisioned Infrastructure';
                 <div style="display: flex; gap: 6px; align-items: center; padding-left: 6px;">
                     <select id="bulkFeAction" class="status-select" style="margin:0;">
                         <option value="">-- Frontend --</option>
-                        <option value="start">Start Service</option>
-                        <option value="stop">Stop Service</option>
-                        <option value="restart">Restart</option>
+                        <optgroup label="Daemon">
+                            <option value="start">Start Service</option>
+                            <option value="stop">Stop Service</option>
+                            <option value="restart">Restart</option>
+                        </optgroup>
+                        <optgroup label="Build / Deploy">
+                            <option value="create">Create (first-time install)</option>
+                            <option value="update">Update Code (rebuild)</option>
+                            <option value="delete">Delete (wipe + remove unit)</option>
+                        </optgroup>
                     </select>
                     <button class="btn btn-outline" type="button" onclick="runBulk('fe')"><i class="fa-solid fa-bolt"></i> Run</button>
                 </div>
@@ -339,10 +346,24 @@ function showToast(type, message) {
 }
 
 // Bulk Actions Logic
+//
+// The selected action determines BOTH which endpoint we POST to and the
+// payload shape:
+//
+//   daemon ops (start/stop/restart) → ajax_service_handler.php?id=<id>
+//                                       body: ajax_action=<action>&service_type=<be|fe>
+//
+//   FE create / update / delete     → setup_frontend.php
+//                                       body: panel_id=<id>&action=<create|update|delete>
+//
+//   BE create                       → setup_backend.php
+//                                       body: panel_id=<id>
+//                                     (BE update/delete aren't implemented as bulk endpoints yet)
+//
 function runBulk(type) {
     const select = document.getElementById(type === 'be' ? 'bulkBeAction' : 'bulkFeAction');
     const action = select.value;
-    
+
     if (!action) {
         showToast('error', 'Please select an action from the dropdown first.');
         return;
@@ -354,59 +375,112 @@ function runBulk(type) {
         return;
     }
 
-    let confirmMsg = `Are you sure you want to bulk ${action.toUpperCase()} the ${type.toUpperCase()} service for ${checkboxes.length} panel(s)?`;
-    if (action === 'create' || action === 'update') {
-        confirmMsg = `WARNING: Bulk ${action.toUpperCase()} will rapidly dispatch background build tasks to ${checkboxes.length} remote servers concurrently. Proceed?`;
+    // --- Decide endpoint + payload shape -----------------------------------
+    const DAEMON_OPS = ['start', 'stop', 'restart'];
+    const BUILD_OPS  = ['create', 'update', 'delete'];
+
+    let endpoint = null;
+    let buildBody = null;       // function(id) → FormData
+
+    if (DAEMON_OPS.includes(action)) {
+        endpoint = (id) => `ajax_service_handler.php?id=${id}`;
+        buildBody = (id) => {
+            const fd = new FormData();
+            fd.append('csrf_token', window.__CSRF__);
+            fd.append('ajax_action', action);
+            fd.append('service_type', type);
+            return fd;
+        };
+    } else if (type === 'fe' && BUILD_OPS.includes(action)) {
+        endpoint = () => `setup_frontend.php`;
+        buildBody = (id) => {
+            const fd = new FormData();
+            fd.append('csrf_token', window.__CSRF__);
+            fd.append('panel_id', id);
+            fd.append('action', action);
+            return fd;
+        };
+    } else if (type === 'be' && action === 'create') {
+        endpoint = () => `setup_backend.php`;
+        buildBody = (id) => {
+            const fd = new FormData();
+            fd.append('csrf_token', window.__CSRF__);
+            fd.append('panel_id', id);
+            return fd;
+        };
+    } else {
+        // BE update / delete are intentionally per-panel only — running them
+        // in bulk wipes /root/somaniOne-main on N hosts simultaneously, which
+        // is rarely what an admin actually wants.
+        showToast('error', `Bulk ${action.toUpperCase()} isn't available for ${type.toUpperCase()}. Open the panel individually.`);
+        return;
     }
-    
+
+    // --- Confirm ------------------------------------------------------------
+    let confirmMsg = `Are you sure you want to bulk ${action.toUpperCase()} the ${type.toUpperCase()} service for ${checkboxes.length} panel(s)?`;
+    if (BUILD_OPS.includes(action)) {
+        const warn = action === 'delete'
+            ? `WIPE the working dir + remove the systemd unit on ${checkboxes.length} host(s).`
+            : `Build/${action} will run in the background on ${checkboxes.length} remote host(s) concurrently (5–10 min each). Watch each panel's terminal for progress.`;
+        confirmMsg = `WARNING — ${warn}\n\nContinue?`;
+    }
     if (!confirm(confirmMsg)) return;
 
-    showToast('success', `Dispatching bulk ${action.toUpperCase()} commands...`);
+    showToast('success', `Dispatching bulk ${action.toUpperCase()} to ${checkboxes.length} panel(s)...`);
 
+    // --- Fan out -----------------------------------------------------------
+    window.__CSRF__ = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
     const ids = Array.from(checkboxes).map(cb => cb.value);
-    let promises = [];
-
-    const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+    let okCount = 0, errCount = 0;
+    const promises = [];
 
     for (const id of ids) {
-        const formData = new FormData();
-        formData.append('csrf_token', csrf);
-        formData.append('ajax_action', action);
-        formData.append('service_type', type);
+        const row = document.getElementById('row-' + id);
+        if (row) row.style.opacity = '0.4';
 
-        let row = document.getElementById('row-' + id);
-        if(row) row.style.opacity = '0.4';
-
-        // Call the AJAX handler for each checked panel
-        let p = fetch(`ajax_service_handler.php?id=${id}`, {
+        const p = fetch(endpoint(id), {
             method: 'POST',
-            headers: { 'X-CSRF-Token': csrf },
-            body: formData
+            headers: { 'X-CSRF-Token': window.__CSRF__ },
+            body: buildBody(id)
         })
             .then(async res => {
-                if (!res.ok) throw new Error("HTTP error " + res.status);
                 const text = await res.text();
-                try { return JSON.parse(text); } 
-                catch(e) { throw new Error("Server returned invalid JSON."); }
+                let data;
+                try { data = JSON.parse(text); }
+                catch (e) { throw new Error("Server returned invalid JSON: " + text.slice(0, 80)); }
+                if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+                return data;
             })
             .then(data => {
-                if (data.status === 'success') {
-                    if(row) row.style.opacity = '1';
+                // Daemon endpoint returns {status: 'success'|'error'};
+                // setup_* endpoints return {success: true|false, message}.
+                const ok = (data.status === 'success') || (data.success === true);
+                if (ok) {
+                    if (row) { row.style.opacity = '1'; row.style.borderLeft = '4px solid var(--accent-green)'; }
+                    okCount++;
                 } else {
-                    if(row) row.style.borderLeft = "4px solid var(--accent-red)";
+                    if (row) { row.style.opacity = '1'; row.style.borderLeft = '4px solid var(--accent-orange)'; }
+                    errCount++;
+                    console.warn(`Panel ${id}:`, data.message || data.error || 'unknown error');
                 }
             })
             .catch(err => {
                 console.error(`Panel ${id} Error:`, err);
-                if(row) row.style.borderLeft = "4px solid var(--accent-red)";
+                if (row) { row.style.opacity = '1'; row.style.borderLeft = '4px solid var(--accent-red)'; }
+                errCount++;
             });
-            
+
         promises.push(p);
     }
 
     Promise.all(promises).then(() => {
-        showToast('success', `All commands dispatched! Reloading in 2 seconds...`);
-        setTimeout(() => location.reload(), 2000);
+        const verb = BUILD_OPS.includes(action) ? 'kicked off' : 'dispatched';
+        if (errCount === 0) {
+            showToast('success', `${okCount} panel(s) ${verb}. Reloading in 3s...`);
+        } else {
+            showToast('error',   `${okCount} ${verb}, ${errCount} failed. Check rows highlighted in red/orange. Reloading in 5s...`);
+        }
+        setTimeout(() => location.reload(), errCount === 0 ? 3000 : 5000);
     });
 }
 
