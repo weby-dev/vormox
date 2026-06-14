@@ -194,17 +194,22 @@ $admin = $adminStmt->fetch();
 $page_title = 'Manage: ' . $panel['domain'];
 ?>
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
+  <!-- Vormox favicon (global) -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
   
   <script>
     const savedTheme = localStorage.getItem('admin_theme');
     const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-    const initialTheme = savedTheme === 'light' || (!savedTheme && prefersLight) ? 'light' : 'dark';
+    const initialTheme = savedTheme === 'dark' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', initialTheme);
   </script>
 
@@ -457,12 +462,12 @@ $page_title = 'Manage: ' . $panel['domain'];
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Build & Deployment</div>
                     
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-                        <!-- Create Backend → runs the first-time installer over SSH on the BE host. -->
-                        <button type="button" id="createBackendBtn" onclick="createBackend(this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Backend</button>
-                        <button type="button" onclick="runAction('update', 'be', this)" class="control-btn btn-update" style="margin: 0;"><i class="fa-brands fa-git-alt"></i> Update Code</button>
+                        <!-- Create / Update / Delete Backend → detached SSH worker in admin/setup_backend.php. -->
+                        <button type="button" id="createBackendBtn" onclick="runBackendJob('create', this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Backend</button>
+                        <button type="button" onclick="runBackendJob('update', this)" class="control-btn btn-update" style="margin: 0;"><i class="fa-brands fa-git-alt"></i> Update Code</button>
                     </div>
-                    
-                    <button type="button" onclick="runAction('remove', 'be', this)" class="control-btn btn-remove"><i class="fa-solid fa-trash-can"></i> Delete Backend</button>
+
+                    <button type="button" onclick="runBackendJob('delete', this)" class="control-btn btn-remove"><i class="fa-solid fa-trash-can"></i> Delete Backend</button>
                 </div>
             <?php else: ?>
                 <div style="color: var(--text-dim); text-align: center; padding: 20px;">No backend mapped.</div>
@@ -768,32 +773,38 @@ function confirmTermination() {
         });
 }
 
-// --- CREATE BACKEND (first-time installer) ---
-// Fires the SSH installer documented in admin/setup_backend.php. The bash
-// script runs detached on the backend host and writes progress to
-// /var/log/vormox/<domain>-task.log — which this page already tails when
-// the log dropdown is set to "Backend Build & Task Progress".
-async function createBackend(btn) {
-    const confirmMsg =
-        'Run the FIRST-TIME backend installer on this panel?\n\n' +
-        '• apt update + apt install (git, maven, openjdk-21-jdk)\n' +
-        '• git clone the backend repo\n' +
-        '• mvn clean package -DskipTests (several minutes)\n' +
-        '• write /etc/systemd/system/<service>.service\n' +
-        '• systemctl enable + restart\n\n' +
-        'Total time: 5–10 minutes. Progress streams to the terminal below.\n' +
-        'Existing /root/somaniOne-main will be wiped before clone.';
-    if (!confirm(confirmMsg)) return;
+// --- BACKEND CREATE / UPDATE / DELETE ---
+// All three call admin/setup_backend.php which dispatches a detached bash
+// worker over SSH to the BE host (create/update can run for minutes — a
+// synchronous handler would time out). Progress streams to
+// /var/log/vormox/<domain>-task.log; we auto-switch the terminal pane to
+// "Backend Build & Task Progress" on success. Mirrors runFrontendJob().
+async function runBackendJob(action, btn) {
+    const verbs = {
+        create: 'Run the FIRST-TIME backend installer on this panel?\n\n' +
+                '• apt update + apt install (git, maven, openjdk-21-jdk)\n' +
+                '• git clone the backend repo\n' +
+                '• mvn clean package -DskipTests (several minutes)\n' +
+                '• write /etc/systemd/system/<service>.service + enable + start\n\n' +
+                'Total time: 5–10 minutes. Existing /root/somaniOne-main will be wiped before clone.',
+        update: 'UPDATE the backend (stop service, pull latest code, mvn rebuild, restart)?\n\n' +
+                'Any local code changes on the BE host will be discarded.',
+        delete: 'DELETE the backend (stop + disable + remove unit + rm -rf /root/somaniOne-main)?\n\n' +
+                'This cannot be undone.'
+    };
+    if (!verbs[action]) return;
+    if (!confirm(verbs[action])) return;
 
     const csrf = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
     const original = btn.innerHTML;
     btn.disabled = true;
-    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Launching installer…';
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Launching…';
 
     try {
         const fd = new FormData();
         fd.append('csrf_token', csrf);
         fd.append('panel_id', panelId);
+        fd.append('action', action);
 
         const res = await fetch('setup_backend.php', {
             method: 'POST',
@@ -803,8 +814,8 @@ async function createBackend(btn) {
         const data = await res.json();
 
         if (data.success) {
-            showToast('success', data.message || 'Installer started.');
-            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Installer running…';
+            showToast('success', data.message || 'Backend job started.');
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Running…';
             // Auto-switch the terminal to the build/task log so admin
             // doesn't have to fish for it in the dropdown.
             const logSel = document.getElementById('logSource');
@@ -812,13 +823,15 @@ async function createBackend(btn) {
                 logSel.value = 'be_task';
                 logSel.dispatchEvent(new Event('change'));
             }
+            // Delete completes fast; create/update run for minutes, so leave the
+            // button in "running" state. A page reload resets it.
         } else {
-            showToast('error', data.message || 'Could not start installer.');
+            showToast('error', data.message || 'Could not start backend job.');
             btn.innerHTML = original;
             btn.disabled = false;
         }
     } catch (err) {
-        showToast('error', 'Network error launching installer.');
+        showToast('error', 'Network error launching backend job.');
         btn.innerHTML = original;
         btn.disabled = false;
     }

@@ -70,10 +70,11 @@ elseif ($tierCount > 3) $featuredIndex = (int)floor($tierCount / 2);
   <meta name="theme-color" content="#050810" />
   <link rel="canonical" href="https://vormox.com/" />
 
+  <!-- Vormox favicon (global) -->
   <link rel="icon" type="image/svg+xml" href="/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
-  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="manifest" href="/site.webmanifest">
 
   <meta property="og:type" content="website" />
@@ -127,7 +128,7 @@ elseif ($tierCount > 3) $featuredIndex = (int)floor($tierCount / 2);
   <script>
     const savedTheme = localStorage.getItem('theme');
     const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-    const initialTheme = savedTheme ? savedTheme : (prefersLight ? 'light' : 'dark');
+    const initialTheme = savedTheme ? savedTheme : 'light';
     document.documentElement.setAttribute('data-theme', initialTheme);
     localStorage.setItem('theme', initialTheme);
   </script>
@@ -264,6 +265,13 @@ elseif ($tierCount > 3) $featuredIndex = (int)floor($tierCount / 2);
       font-size: 14px; color: #fff; box-shadow: 0 0 24px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,.2);
     }
     .logo span { color: var(--accent2); }
+    .brand-logo { height: 40px; width: auto; display: block; }
+    .dark-logo  { display: none; }
+    .light-logo { display: block; }
+    [data-theme="dark"]  .light-logo { display: none; }
+    [data-theme="dark"]  .dark-logo  { display: block; }
+    [data-theme="light"] .dark-logo  { display: none; }
+    [data-theme="light"] .light-logo { display: block; }
     .nav-links { display: flex; align-items: center; gap: 32px; list-style: none; }
     .nav-links a {
       color: var(--text-muted); text-decoration: none; font-size: 14px;
@@ -637,8 +645,8 @@ elseif ($tierCount > 3) $featuredIndex = (int)floor($tierCount / 2);
 
 <nav id="nav" role="navigation" aria-label="Main navigation">
   <a href="/" class="logo" aria-label="Vormox Home">
-    <div class="logo-icon" aria-hidden="true"><i class="fa-solid fa-bolt"></i></div>
-    Vorm<span>ox</span>
+    <img src="/assets/images/logo.svg" alt="Vormox" class="brand-logo light-logo">
+    <img src="/assets/images/logo-b.svg" alt="Vormox" class="brand-logo dark-logo">
   </a>
   <ul class="nav-links">
     <li><a href="#features">Features</a></li>
@@ -955,8 +963,8 @@ elseif ($tierCount > 3) $featuredIndex = (int)floor($tierCount / 2);
   <div class="footer-grid">
     <div class="footer-brand">
       <a href="/" class="logo" aria-label="Vormox Home">
-        <div class="logo-icon" aria-hidden="true"><i class="fa-solid fa-bolt"></i></div>
-        Vorm<span>ox</span>
+        <img src="/assets/images/logo.svg" alt="Vormox" class="brand-logo light-logo">
+        <img src="/assets/images/logo-b.svg" alt="Vormox" class="brand-logo dark-logo">
       </a>
       <p>Enterprise-grade managed Proxmox cloud automation SaaS. Deployed in production by infrastructure teams worldwide.</p>
     </div>

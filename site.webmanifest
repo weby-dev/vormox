@@ -1,0 +1,10 @@
+{
+  "name": "Vormox Automation Cloud",
+  "short_name": "Vormox",
+  "icons": [
+    { "src": "/favicon.svg", "type": "image/svg+xml", "sizes": "any" }
+  ],
+  "theme_color": "#050810",
+  "background_color": "#050810",
+  "display": "standalone"
+}

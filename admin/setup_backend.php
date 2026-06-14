@@ -1,20 +1,22 @@
 <?php
 // admin/setup_backend.php
 //
-// Kicks off the first-time backend installer for a panel. Generates a bash
-// script with the panel's specific credentials, SCPs it onto the backend
-// host, and runs it in the background with output to
+// Three actions for the Java/Maven backend, all dispatched over SSH as a
+// detached bash worker on the BE host:
+//   action=create  → apt deps, git clone, mvn build, write systemd unit, start
+//   action=update  → stop, refresh code from git, mvn rebuild, repoint unit, restart
+//   action=delete  → stop + disable + remove unit file + rm -rf the project dir
+//
+// All long-running work happens in a detached bash script writing progress to
 //   /var/log/vormox/<domain>-task.log
+// which the admin watches live via the "Backend Build & Task Progress" channel
+// on manage_panel.php. This mirrors setup_frontend.php exactly.
 //
-// The admin watches progress live via the existing "Backend Build & Task
-// Progress" channel on manage_panel.php (which tails that same file).
-//
-// PHP sets panel_details.be_status = 'installing' before kickoff. The bash
-// script can't reach the Vormox DB (it only has the customer's credentials),
-// so it drops a marker at /var/log/vormox/<domain>-task.status containing
-// either 'installed' or 'error'. Admins read this from the terminal pane.
-// A future lifecycle cron tick is the right place to reflect this into the
-// Vormox DB if you want automated status transitions.
+// PHP sets panel_details.be_status = 'installing' before a create/update kickoff.
+// The bash script can't reach the Vormox DB (it only has the customer's
+// credentials), so it drops a marker at /var/log/vormox/<domain>-task.status
+// containing 'installed' / 'error' / 'removed'. A future lifecycle cron tick is
+// the right place to reflect that back into the Vormox DB.
 
 session_start();
 require_once '../config.php';
@@ -47,11 +49,15 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 $panel_id = filter_input(INPUT_POST, 'panel_id', FILTER_VALIDATE_INT);
+$action   = strtolower((string) ($_POST['action'] ?? 'create'));
+if (!in_array($action, ['create', 'update', 'delete'], true)) {
+    echo json_encode(['success' => false, 'message' => 'Unknown action.']); exit;
+}
 if (!$panel_id) {
     echo json_encode(['success' => false, 'message' => 'Missing panel_id.']); exit;
 }
 
-// --- Load the panel + details, fail loudly on missing required fields ---
+// --- Load the panel + details ---
 try {
     $stmt = $pdo->prepare("
         SELECT p.id, p.domain, p.status,
@@ -72,8 +78,18 @@ if (!$panel) {
     echo json_encode(['success' => false, 'message' => 'Panel not found, or details have not been saved yet.']); exit;
 }
 
-$required = [
-    'domain'       => 'Domain',
+// --- Required fields depend on the action ---
+//   • every action needs to reach the box + know which unit to control
+//   • create/update need the repo URL
+//   • only create writes the systemd unit, so only create needs the DB creds
+$required = ['be_server_ip', 'be_ssh_user', 'be_ssh_pass', 'be_service'];
+if (in_array($action, ['create', 'update'], true)) {
+    $required[] = 'be_git_url';
+}
+if ($action === 'create') {
+    array_push($required, 'db_server_ip', 'db_name', 'db_user', 'db_pass');
+}
+$labels = [
     'be_server_ip' => 'Backend Server IP',
     'be_ssh_user'  => 'Backend SSH User',
     'be_ssh_pass'  => 'Backend SSH Password',
@@ -85,9 +101,10 @@ $required = [
     'db_pass'      => 'DB Password',
 ];
 $missing = [];
-foreach ($required as $col => $label) {
-    if (empty($panel[$col])) $missing[] = $label;
+foreach ($required as $col) {
+    if (empty($panel[$col])) $missing[] = $labels[$col] ?? $col;
 }
+if (empty($panel['domain'])) $missing[] = 'Panel domain';
 if ($missing) {
     echo json_encode([
         'success' => false,
@@ -97,13 +114,13 @@ if ($missing) {
 }
 
 // --- Generate per-install secrets so two panels never share a JWT key ---
-// 16-byte AES-128 key + 32-byte JWT secret (base64).
+// (Only consumed by the create body — update preserves the existing unit.)
 $app_enc_key  = bin2hex(random_bytes(8));               // 16 hex chars = 16 bytes when used as a string
 $jwt_key_b64  = base64_encode(random_bytes(48));        // 48 random bytes → 64 base64 chars
 
-// --- Build the auth-injected git URL ---
+// --- Build the auth-injected git URL (only relevant for create/update) ---
 $git_url = $panel['be_git_url'];
-if (!empty($panel['be_git_user'])) {
+if (!empty($panel['be_git_user']) && in_array($action, ['create', 'update'], true)) {
     $auth = rawurlencode($panel['be_git_user']);
     if (!empty($panel['be_git_pass'])) {
         $auth .= ':' . rawurlencode($panel['be_git_pass']);
@@ -111,28 +128,28 @@ if (!empty($panel['be_git_user'])) {
     $git_url = preg_replace('|^(https?://)|i', '\\1' . $auth . '@', $git_url, 1);
 }
 
-// --- Build the bash script ---
 $ssh_port = (int) ($panel['be_ssh_port'] ?: 22);
+$domain   = $panel['domain'];
 
 // Normalize the service name. The bash script ALWAYS writes the unit to
 // /etc/systemd/system/<service>.service, so if the admin typed the suffix
-// already (e.g. "somani-one.service") we strip it here — otherwise the
-// file lands at /etc/systemd/system/somani-one.service.service and
+// already (e.g. "somani-one.service") we strip it here — otherwise the file
+// lands at /etc/systemd/system/somani-one.service.service and
 // `systemctl enable somani-one.service` fails to find it.
 $service  = preg_replace('/[^A-Za-z0-9._-]/', '', $panel['be_service']) ?: 'vormox-backend';
 $service  = preg_replace('/\.service$/i', '', $service);
 
-// Render the script. ALL placeholders are substituted PHP-side; nothing inside
-// the heredoc depends on $variable interpolation by bash unless prefixed with
-// the literal $ that we want to survive into bash.
-$script = <<<BASH
+// ---------------------------------------------------------------------------
+// Shared script header — lock, logging, fail()/run() helpers.
+// All three actions log to the same per-domain file so the admin sees the
+// full history. The lock is shared across every backend job on this host
+// (they all touch /root/somaniOne-main), so only one can run at a time.
+// ---------------------------------------------------------------------------
+$header = <<<HDR
 #!/bin/bash
-# ---------------------------------------------------------------------------
-# Auto-generated backend installer for {$panel['domain']}
-# ---------------------------------------------------------------------------
-set -u   # error on undefined vars (but NOT -e — we handle errors explicitly)
+set -u
 
-DOMAIN="{$panel['domain']}"
+DOMAIN="{$domain}"
 SERVICE="{$service}"
 BACKEND_DIR="/root/somaniOne-main"
 LOG_DIR="/var/log/vormox"
@@ -146,23 +163,21 @@ chmod 600 "\$LOG"
 ts() { date '+[%Y-%m-%d %H:%M:%S]'; }
 log() { echo "\$(ts) \$*" >> "\$LOG"; }
 
-# Concurrency guard. The script touches /root/somaniOne-main which is shared
-# across every backend install on this host — two scripts running at once
-# corrupt the clone. Acquire an exclusive lock on /var/lock/vormox-backend.lock
-# and bail cleanly if a sibling already holds it.
+# Concurrency guard. /root/somaniOne-main is shared across every backend job
+# on this host — two scripts at once corrupt the clone. flock -n bails
+# immediately if a sibling create/update/delete already holds the lock.
 exec 200>/var/lock/vormox-backend.lock
 if ! flock -n 200; then
-    log "Another backend setup is already running on this host. Exiting."
+    log "Another backend job is already running on this host. Exiting."
     exit 0
 fi
 
 fail() {
     log "FATAL: \$*"
     log "==========================================="
-    log "FAILURE: Backend setup aborted for \$DOMAIN"
+    log "FAILURE: Backend {$action} aborted for \$DOMAIN"
     log "==========================================="
-    # Drop a marker the admin (or a future lifecycle cron tick) can detect.
-    echo "error" > "/var/log/vormox/\${DOMAIN}-task.status" 2>/dev/null || true
+    echo "error" > "\${LOG_DIR}/\${DOMAIN}-task.status" 2>/dev/null || true
     exit 1
 }
 
@@ -172,16 +187,19 @@ run() {
         fail "Step failed: \$*"
     fi
 }
+HDR;
 
+// ---------------------------------------------------------------------------
+// Per-action script body.
+// ---------------------------------------------------------------------------
+if ($action === 'create') {
+    $body = <<<SCRIPT
 log "==========================================="
 log "Starting backend setup for \$DOMAIN"
 log "Service: \$SERVICE   |   Working dir: \$BACKEND_DIR"
 log "==========================================="
 
-# -----------------------------------------------------------------
-# Step 1: prerequisites
-# (apt update → apt upgrade → set timezone → install our build deps)
-# -----------------------------------------------------------------
+# Step 1: prerequisites (apt update → upgrade → timezone → build deps)
 log ""
 log ">>> Step 1/5: system prep + install prerequisites"
 export DEBIAN_FRONTEND=noninteractive
@@ -193,21 +211,16 @@ run "apt-get \$APT_OPTS upgrade -y"
 run "timedatectl set-timezone Asia/Kolkata"
 run "apt-get install -y git maven openjdk-21-jdk default-mysql-client"
 
-# -----------------------------------------------------------------
 # Step 2: clone repo (clean slate)
-# -----------------------------------------------------------------
 log ""
 log ">>> Step 2/5: cloning backend repo"
 if [ -d "\$BACKEND_DIR" ]; then
     log "Removing existing \$BACKEND_DIR"
     rm -rf "\$BACKEND_DIR"
 fi
-# git URL has auth pre-embedded if needed
 run "git clone '{$git_url}' '\$BACKEND_DIR'"
 
-# -----------------------------------------------------------------
 # Step 3: maven build
-# -----------------------------------------------------------------
 log ""
 log ">>> Step 3/5: mvn clean package -DskipTests (this can take several minutes)"
 cd "\$BACKEND_DIR" || fail "cd into \$BACKEND_DIR"
@@ -220,9 +233,7 @@ if [ -z "\$JAR" ]; then
 fi
 log "Built jar: \$JAR"
 
-# -----------------------------------------------------------------
 # Step 4: systemd unit
-# -----------------------------------------------------------------
 log ""
 log ">>> Step 4/5: writing /etc/systemd/system/\${SERVICE}.service"
 cat > "/etc/systemd/system/\${SERVICE}.service" <<UNIT
@@ -240,7 +251,7 @@ Group=root
 WorkingDirectory=\$BACKEND_DIR
 
 Environment="APP_ENCRYPTION_KEY={$app_enc_key}"
-Environment="APP_FRONTEND_URL=https://{$panel['domain']}"
+Environment="APP_FRONTEND_URL=https://{$domain}"
 Environment="JDBC_DATABASE_URL=jdbc:mysql://{$panel['db_server_ip']}:3306/{$panel['db_name']}?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true"
 Environment="JDBC_DATABASE_USERNAME={$panel['db_user']}"
 Environment="JDBC_DATABASE_PASSWORD={$panel['db_pass']}"
@@ -261,18 +272,16 @@ TimeoutStopSec=30
 WantedBy=multi-user.target
 UNIT
 
-# -----------------------------------------------------------------
 # Step 5: enable + start, wait for healthy
-# -----------------------------------------------------------------
 log ""
 log ">>> Step 5/5: systemctl reload + enable + restart + wait"
 run "systemctl daemon-reload"
 run "systemctl enable \$SERVICE"
 run "systemctl restart \$SERVICE"
 
-# Java apps take ~2-3 minutes to fully start. Watch up to 5 minutes total,
-# checking once per 5s. We need TWO consecutive 'active' samples (5s apart)
-# because Spring Boot can briefly look healthy before crashing on config.
+# Java apps take ~2-3 minutes to fully start. Watch up to 5 minutes, checking
+# every 5s. Need TWO consecutive 'active' samples because Spring Boot can
+# briefly look healthy before crashing on config.
 log "Waiting for \$SERVICE to become healthy (up to 5 min)…"
 HEALTHY=0
 for i in \$(seq 1 60); do
@@ -293,7 +302,7 @@ if [ "\$HEALTHY" -eq 1 ]; then
     log "SUCCESS: Backend setup complete for \$DOMAIN"
     log "Service: \$SERVICE is active"
     log "==========================================="
-    echo "installed" > "/var/log/vormox/\${DOMAIN}-task.status" 2>/dev/null || true
+    echo "installed" > "\${LOG_DIR}/\${DOMAIN}-task.status" 2>/dev/null || true
     exit 0
 else
     log ""
@@ -301,11 +310,118 @@ else
     journalctl -u "\$SERVICE" -n 40 --no-pager >> "\$LOG" 2>&1 || true
     fail "Service \$SERVICE never reached active state"
 fi
-BASH;
+SCRIPT;
 
-// --- Ship + execute ---
+} elseif ($action === 'update') {
+    $body = <<<SCRIPT
+log "==========================================="
+log "Updating backend for \$DOMAIN"
+log "Service: \$SERVICE   |   Working dir: \$BACKEND_DIR"
+log "==========================================="
+
+# Stop the running service first so the rebuild doesn't race the live process.
+log ""
+log ">>> Step 1/5: stopping \$SERVICE"
+systemctl stop "\$SERVICE" >> "\$LOG" 2>&1 || log "  (service was not running)"
+
+# Refresh source. Prefer an in-place fast-forward of the existing checkout;
+# fall back to a clean clone if the dir isn't a git repo.
+log ""
+log ">>> Step 2/5: wiping \$BACKEND_DIR and re-cloning"
+rm -rf "\$BACKEND_DIR"
+run "git clone '{$git_url}' '\$BACKEND_DIR'"
+cd "\$BACKEND_DIR" || fail "cd into \$BACKEND_DIR"
+
+# Rebuild
+log ""
+log ">>> Step 3/5: mvn clean package -DskipTests (this can take several minutes)"
+run "mvn -q clean package -DskipTests"
+
+JAR=\$(ls "\$BACKEND_DIR"/target/*.jar 2>/dev/null | grep -v -- '-original' | grep -v 'sources' | grep -v 'javadoc' | head -1)
+if [ -z "\$JAR" ]; then
+    fail "Build did not produce a runnable jar under \$BACKEND_DIR/target"
+fi
+log "Built jar: \$JAR"
+
+# Point the existing unit at the freshly-built jar (the version suffix in the
+# filename may have changed). Only ExecStart is rewritten — every Environment=
+# secret written at create time is preserved.
+log ""
+log ">>> Step 4/5: pointing the systemd unit at the new jar"
+UNIT_FILE="/etc/systemd/system/\${SERVICE}.service"
+if [ ! -f "\$UNIT_FILE" ]; then
+    fail "Unit \$UNIT_FILE not found — run Create Backend first"
+fi
+sed -i "s|^ExecStart=.*|ExecStart=/usr/bin/java -jar \$JAR|" "\$UNIT_FILE"
+
+log ""
+log ">>> Step 5/5: systemctl reload + restart + wait"
+run "systemctl daemon-reload"
+run "systemctl restart \$SERVICE"
+
+log "Waiting for \$SERVICE to become healthy (up to 5 min)…"
+HEALTHY=0
+for i in \$(seq 1 60); do
+    if systemctl is-active --quiet "\$SERVICE"; then
+        sleep 5
+        if systemctl is-active --quiet "\$SERVICE"; then
+            HEALTHY=1
+            break
+        fi
+    fi
+    if [ \$((i % 6)) -eq 0 ]; then log "  …still waiting (\$((i * 5))s elapsed)"; fi
+    sleep 5
+done
+
+if [ "\$HEALTHY" -eq 1 ]; then
+    log ""
+    log "==========================================="
+    log "SUCCESS: Backend updated for \$DOMAIN"
+    log "==========================================="
+    echo "installed" > "\${LOG_DIR}/\${DOMAIN}-task.status" 2>/dev/null || true
+    exit 0
+else
+    log ""
+    log "Service did not become healthy. Last 40 lines of journal:"
+    journalctl -u "\$SERVICE" -n 40 --no-pager >> "\$LOG" 2>&1 || true
+    fail "Service \$SERVICE never reached active state after update"
+fi
+SCRIPT;
+
+} else { // delete
+    $body = <<<SCRIPT
+log "==========================================="
+log "Deleting backend for \$DOMAIN"
+log "Service: \$SERVICE   |   Working dir: \$BACKEND_DIR"
+log "==========================================="
+
+log ""
+log ">>> Step 1/4: stopping \$SERVICE"
+systemctl stop "\$SERVICE" >> "\$LOG" 2>&1 || log "  (already stopped)"
+
+log ">>> Step 2/4: disabling \$SERVICE"
+systemctl disable "\$SERVICE" >> "\$LOG" 2>&1 || log "  (was not enabled)"
+
+log ">>> Step 3/4: removing /etc/systemd/system/\${SERVICE}.service"
+rm -f "/etc/systemd/system/\${SERVICE}.service"
+systemctl daemon-reload >> "\$LOG" 2>&1 || true
+
+log ">>> Step 4/4: removing \$BACKEND_DIR"
+rm -rf "\$BACKEND_DIR"
+
+log "==========================================="
+log "SUCCESS: Backend removed for \$DOMAIN"
+log "==========================================="
+echo "removed" > "\${LOG_DIR}/\${DOMAIN}-task.status" 2>/dev/null || true
+exit 0
+SCRIPT;
+}
+
+$script = $header . "\n\n" . $body;
+
+// --- Ship + execute over SSH (same pattern as setup_frontend.php) ---
 $b64 = base64_encode($script);
-$script_path = "/tmp/vormox-setup-{$panel_id}.sh";
+$script_path = "/tmp/vormox-be-{$action}-{$panel_id}.sh";
 
 if (!function_exists('ssh2_connect')) {
     echo json_encode(['success' => false, 'message' => 'PHP ssh2 extension missing on web server.']); exit;
@@ -328,19 +444,20 @@ if (!@ssh2_auth_password($conn, $panel['be_ssh_user'], $panel['be_ssh_pass'])) {
     echo json_encode(['success' => false, 'message' => 'SSH authentication failed.']); exit;
 }
 
-// Mark installing BEFORE we kick the script off — that way the UI status
-// flips immediately and if the kickoff itself fails we'll see "installing"
-// stuck forever (which is a useful signal too).
-try {
-    $pdo->prepare("UPDATE panel_details SET be_status = 'installing' WHERE panel_id = ?")
-        ->execute([$panel_id]);
-} catch (PDOException $e) { /* non-fatal */ }
+// Mark installing BEFORE kickoff for create/update — the UI status flips
+// immediately, and if the kickoff itself fails it stays "installing" (a useful
+// stuck-signal). Delete leaves the stored status untouched (mirrors frontend).
+if (in_array($action, ['create', 'update'], true)) {
+    try {
+        $pdo->prepare("UPDATE panel_details SET be_status = 'installing' WHERE panel_id = ?")
+            ->execute([$panel_id]);
+    } catch (PDOException $e) { /* non-fatal */ }
+}
 
-// Concurrency precheck — `flock -n` exits 1 immediately if the lock is
-// already held. We pre-test so the admin gets a clear "already running"
-// error instead of a silent "Launched" toast for a script that promptly
-// exits. (The bash script also re-acquires the lock as a backup in case
-// the race fires between this test and the kickoff.)
+// Concurrency precheck — `flock -n` exits 1 immediately if the lock is already
+// held. We pre-test so the admin gets a clear "already running" error instead
+// of a silent "Launched" toast for a script that promptly exits. (The bash
+// script also re-acquires the lock as a backup in case the race fires.)
 $precheck = "mkdir -p /var/lock && flock -n /var/lock/vormox-backend.lock -c true && echo OK || echo LOCKED";
 $pstream = @ssh2_exec($conn, $precheck);
 if ($pstream) {
@@ -350,7 +467,7 @@ if ($pstream) {
     if (stripos($presult, 'LOCKED') !== false) {
         echo json_encode([
             'success' => false,
-            'message' => 'A backend install is already running on this host. Watch the task log; if it looks stuck, wait a few minutes or remove /var/lock/vormox-backend.lock manually.',
+            'message' => 'A backend job is already running on this host. Watch the task log; if it looks stuck, wait a few minutes or remove /var/lock/vormox-backend.lock manually.',
         ]);
         exit;
     }
@@ -370,10 +487,12 @@ stream_set_blocking($stream, true);
 @stream_get_contents(@ssh2_fetch_stream($stream, SSH2_STREAM_STDIO));
 @fclose($stream);
 
+$niceVerb = ['create' => 'setup', 'update' => 'update', 'delete' => 'removal'][$action];
 echo json_encode([
-    'success' => true,
-    'message' => 'Backend setup launched. Watch progress in the panel terminal ("Backend Build & Task Progress").',
-    'panel_id' => $panel_id,
-    'log_path' => "/var/log/vormox/{$panel['domain']}-task.log",
+    'success'    => true,
+    'message'    => "Backend {$niceVerb} launched. Watch progress in the panel terminal (\"Backend Build & Task Progress\").",
+    'panel_id'   => $panel_id,
+    'service'    => $service,
+    'log_path'   => "/var/log/vormox/{$domain}-task.log",
     'manage_url' => "manage_panel.php?id={$panel_id}",
 ]);

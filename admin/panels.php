@@ -69,17 +69,22 @@ try {
 $page_title = 'Provisioned Infrastructure';
 ?>
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head><?= csrf_meta() ?>
   <meta charset="UTF-8">
   <title><?= htmlspecialchars($page_title) ?> — Vormox Admin</title>
+  <!-- Vormox favicon (global) -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
   
   <script>
     const savedTheme = localStorage.getItem('admin_theme');
     const prefersLight = window.matchMedia('(prefers-color-scheme: light)').matches;
-    document.documentElement.setAttribute('data-theme', savedTheme === 'light' || (!savedTheme && prefersLight) ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', savedTheme === 'dark' ? 'dark' : 'light');
   </script>
 
   <style>
@@ -356,9 +361,8 @@ function showToast(type, message) {
 //   FE create / update / delete     → setup_frontend.php
 //                                       body: panel_id=<id>&action=<create|update|delete>
 //
-//   BE create                       → setup_backend.php
-//                                       body: panel_id=<id>
-//                                     (BE update/delete aren't implemented as bulk endpoints yet)
+//   BE create / update / delete     → setup_backend.php
+//                                       body: panel_id=<id>&action=<create|update|delete>
 //
 function runBulk(type) {
     const select = document.getElementById(type === 'be' ? 'bulkBeAction' : 'bulkFeAction');
@@ -400,18 +404,18 @@ function runBulk(type) {
             fd.append('action', action);
             return fd;
         };
-    } else if (type === 'be' && action === 'create') {
+    } else if (type === 'be' && BUILD_OPS.includes(action)) {
+        // Backend create/update/delete all dispatch a detached worker via
+        // setup_backend.php (same action-based contract as setup_frontend.php).
         endpoint = () => `setup_backend.php`;
         buildBody = (id) => {
             const fd = new FormData();
             fd.append('csrf_token', window.__CSRF__);
             fd.append('panel_id', id);
+            fd.append('action', action);
             return fd;
         };
     } else {
-        // BE update / delete are intentionally per-panel only — running them
-        // in bulk wipes /root/somaniOne-main on N hosts simultaneously, which
-        // is rarely what an admin actually wants.
         showToast('error', `Bulk ${action.toUpperCase()} isn't available for ${type.toUpperCase()}. Open the panel individually.`);
         return;
     }

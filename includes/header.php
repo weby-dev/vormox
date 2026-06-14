@@ -4,6 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title><?= isset($page_title) ? htmlspecialchars($page_title) : 'Dashboard' ?> — Vormox Automation Cloud</title>
+  <!-- Vormox favicon (global) -->
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <?= csrf_meta() ?>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -153,7 +158,7 @@
     @media (max-width: 1024px) { .split-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
-<body data-theme="<?= htmlspecialchars($user['theme'] ?? 'dark') ?>">
+<body data-theme="<?= htmlspecialchars($user['theme'] ?? 'light') ?>">
 
 <?php include 'sidebar.php'; ?>
 

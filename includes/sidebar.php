@@ -2,7 +2,7 @@
 
 <style>
 .logo img {
-  max-height: 50px;
+  height: 40px;         /* matches the landing-page nav logo (.brand-logo) */
   width: auto;
   max-width: 100%;      /* stops the logo overflowing a narrow sidebar */
   object-fit: contain;  /* preserves aspect ratio, no squish/stretch */
