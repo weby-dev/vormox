@@ -436,41 +436,43 @@ $page_title = 'Manage: ' . $panel['domain'];
         
         <div class="card">
             <div class="card-title"><i class="fa-solid fa-server" style="color: var(--accent-green);"></i> Backend Infrastructure</div>
-            <?php if($panel['be_service']): 
-                $isOnline = ($panel['be_status'] === 'online');
-                $isOffline = ($panel['be_status'] === 'offline');
+            <?php
+                $beOnline     = ($panel['be_status'] === 'online');
+                $beOffline    = ($panel['be_status'] === 'offline');
+                $beHasService = !empty($panel['be_service']);
             ?>
+            <?php if (!empty($panel['be_server_ip'])): ?>
                 <div class="data-row">
                     <span class="data-label">Current Status</span>
-                    <span id="be-status-badge" class="badge <?= $isOnline ? 'badge-active' : ($isOffline ? 'badge-offline' : 'badge-other') ?>">
+                    <span id="be-status-badge" class="badge <?= $beOnline ? 'badge-active' : ($beOffline ? 'badge-offline' : 'badge-other') ?>">
                         <?= htmlspecialchars(strtoupper($panel['be_status'] ?? 'UNKNOWN')) ?>
                     </span>
                 </div>
-                <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['be_service']) ?></span></div>
+                <div class="data-row"><span class="data-label">Service Name</span><span class="data-value data-mono"><?= htmlspecialchars($panel['be_service'] ?: '— (will be created)') ?></span></div>
                 <div class="data-row"><span class="data-label">Server IP</span><span class="data-value data-mono"><?= htmlspecialchars($panel['be_server_ip']) ?></span></div>
-                
+
                 <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Daemon Controls</div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
-                        <button type="button" onclick="runAction('start', 'be', this)" class="control-btn btn-start" style="margin: 0;" <?= $isOnline ? 'disabled' : '' ?>><i class="fa-solid fa-play"></i> Start</button>
-                        <button type="button" onclick="runAction('stop', 'be', this)" class="control-btn btn-stop" style="margin: 0;" <?= $isOffline ? 'disabled' : '' ?>><i class="fa-solid fa-stop"></i> Stop</button>
+                        <button type="button" onclick="runAction('start', 'be', this)" class="control-btn btn-start" style="margin: 0;" <?= ($beOnline || !$beHasService) ? 'disabled' : '' ?>><i class="fa-solid fa-play"></i> Start</button>
+                        <button type="button" onclick="runAction('stop', 'be', this)" class="control-btn btn-stop" style="margin: 0;" <?= ($beOffline || !$beHasService) ? 'disabled' : '' ?>><i class="fa-solid fa-stop"></i> Stop</button>
                     </div>
-                    <button type="button" onclick="runAction('restart', 'be', this)" class="control-btn btn-restart" style="margin-top: 8px;"><i class="fa-solid fa-rotate-right"></i> Soft Restart</button>
+                    <button type="button" onclick="runAction('restart', 'be', this)" class="control-btn btn-restart" style="margin-top: 8px;" <?= !$beHasService ? 'disabled' : '' ?>><i class="fa-solid fa-rotate-right"></i> Soft Restart</button>
                 </div>
 
                 <div style="margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--border);">
                     <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 12px; letter-spacing: 0.1em;">Build & Deployment</div>
-                    
+
                     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
                         <!-- Create / Update / Delete Backend → detached SSH worker in admin/setup_backend.php. -->
                         <button type="button" id="createBackendBtn" onclick="runBackendJob('create', this)" class="control-btn btn-create" style="margin: 0;"><i class="fa-solid fa-hammer"></i> Create Backend</button>
-                        <button type="button" onclick="runBackendJob('update', this)" class="control-btn btn-update" style="margin: 0;"><i class="fa-brands fa-git-alt"></i> Update Code</button>
+                        <button type="button" onclick="runBackendJob('update', this)" class="control-btn btn-update" style="margin: 0;" <?= !$beHasService ? 'disabled' : '' ?>><i class="fa-brands fa-git-alt"></i> Update Code</button>
                     </div>
 
-                    <button type="button" onclick="runBackendJob('delete', this)" class="control-btn btn-remove"><i class="fa-solid fa-trash-can"></i> Delete Backend</button>
+                    <button type="button" onclick="runBackendJob('delete', this)" class="control-btn btn-remove" <?= !$beHasService ? 'disabled' : '' ?>><i class="fa-solid fa-trash-can"></i> Delete Backend</button>
                 </div>
             <?php else: ?>
-                <div style="color: var(--text-dim); text-align: center; padding: 20px;">No backend mapped.</div>
+                <div style="color: var(--text-dim); text-align: center; padding: 20px;">No backend mapped.<br><span style="font-size: 12px;">Fill in the Backend server IP + SSH credentials via <strong>Edit Config</strong> first.</span></div>
             <?php endif; ?>
         </div>
 
@@ -823,8 +825,9 @@ async function runBackendJob(action, btn) {
                 logSel.value = 'be_task';
                 logSel.dispatchEvent(new Event('change'));
             }
-            // Delete completes fast; create/update run for minutes, so leave the
-            // button in "running" state. A page reload resets it.
+            // Watch the remote marker so the button + badge finalize themselves
+            // when the worker actually finishes (instead of spinning forever).
+            pollTaskUntilDone('be', btn, original, { label: 'Backend ' + action });
         } else {
             showToast('error', data.message || 'Could not start backend job.');
             btn.innerHTML = original;
@@ -928,8 +931,9 @@ async function runFrontendJob(action, btn) {
                 logSel.value = 'fe_task';
                 logSel.dispatchEvent(new Event('change'));
             }
-            // Delete completes fast — for create/update, the job runs for minutes,
-            // so leave the button in "running" state. Page reload will reset it.
+            // Watch the remote marker so the button + badge finalize themselves
+            // when the worker actually finishes (instead of spinning forever).
+            pollTaskUntilDone('fe', btn, original, { label: 'Frontend ' + action });
         } else {
             showToast('error', data.message || 'Could not start frontend job.');
             btn.innerHTML = original;
@@ -941,6 +945,67 @@ async function runFrontendJob(action, btn) {
         btn.disabled = false;
     }
 }
+
+// --- TASK COMPLETION POLLER ---
+// create/update/delete launch a DETACHED worker on the remote host, so the HTTP
+// response only means "started", not "finished". This polls task_status until the
+// worker drops its terminal marker (installed / error / removed), then finalizes the
+// button + status badge. Without it the button spun forever — the UI had no way to
+// know the job was done. `btn` may be null when resuming a job after a page reload.
+function pollTaskUntilDone(type, btn, originalHtml, opts) {
+    opts = opts || {};
+    const label   = opts.label || 'Job';
+    const maxMs   = opts.maxMs || 20 * 60 * 1000;   // hard cap so we never poll forever
+    const everyMs = 6000;
+    const started = Date.now();
+    const csrf    = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
+
+    const finish = (cls, msg) => {
+        if (btn) { btn.innerHTML = originalHtml; btn.disabled = false; }
+        if (msg) showToast(cls, msg);
+    };
+    const setBadge = (dbState) => {
+        const badge = document.getElementById(type + '-status-badge');
+        if (badge && dbState) {
+            badge.textContent = dbState.toUpperCase();
+            badge.className = 'badge ' + (dbState === 'online' ? 'badge-active'
+                              : (dbState === 'offline' ? 'badge-offline' : 'badge-other'));
+        }
+    };
+
+    const tick = async () => {
+        if (Date.now() - started > maxMs) {
+            finish('error', `${label} is still running after a long time. Check the task log — the final state will show on reload.`);
+            return;
+        }
+        try {
+            const res = await fetch(`ajax_service_handler.php?id=${panelId}&ajax=task_status&type=${type}`, {
+                headers: { 'X-CSRF-Token': csrf }
+            });
+            const data = await res.json();
+            if (data.status === 'success' && data.done) {
+                setBadge(data.db_state);
+                if (data.state === 'installed')    finish('success', `${label} completed successfully.`);
+                else if (data.state === 'removed') finish('success', `${label} completed — service removed.`);
+                else                               finish('error',   `${label} failed. Check the task log for details.`);
+                setTimeout(() => location.reload(), 2500);
+                return;
+            }
+        } catch (e) { /* transient network/SSH hiccup — keep polling */ }
+        setTimeout(tick, everyMs);
+    };
+    setTimeout(tick, everyMs);
+}
+
+// Resume watching any side a job (possibly a bulk run from panels.php) left mid-flight.
+document.addEventListener('DOMContentLoaded', () => {
+    ['be', 'fe'].forEach(type => {
+        const badge = document.getElementById(type + '-status-badge');
+        if (badge && badge.textContent.trim().toUpperCase() === 'INSTALLING') {
+            pollTaskUntilDone(type, null, '', { label: (type === 'be' ? 'Backend' : 'Frontend') + ' job' });
+        }
+    });
+});
 
 // --- ACTION LOGIC ---
 function runAction(action, type, btn) {

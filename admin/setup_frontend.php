@@ -172,6 +172,8 @@ log "Starting frontend setup for \$DOMAIN"
 log "Service: \$SERVICE   |   Working dir: \$WORK_DIR"
 log "==========================================="
 
+run "systemctl daemon-reload"
+
 # Step 1: Node 20 + git via NodeSource
 log ""
 log ">>> Step 1/6: install Node 20 + git"
@@ -407,7 +409,11 @@ if ($pstream) {
 
 $b64 = base64_encode($script);
 $script_path = "/tmp/vormox-fe-{$action}-{$panel_id}.sh";
+// Remove any stale status marker FIRST — the completion poller treats the
+// marker's presence as "this run finished", so it must not survive a prior run.
+$status_file = escapeshellarg("/var/log/vormox/{$domain}-fe-task.status");
 $kickoff = "mkdir -p /var/log/vormox && "
+        . "rm -f {$status_file} && "
         . "printf '%s' '{$b64}' | base64 -d > {$script_path} && "
         . "chmod +x {$script_path} && "
         . "(nohup bash {$script_path} </dev/null >/dev/null 2>&1 &)";

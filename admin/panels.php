@@ -436,6 +436,7 @@ function runBulk(type) {
     window.__CSRF__ = (document.querySelector('meta[name="csrf-token"]')||{}).content || '';
     const ids = Array.from(checkboxes).map(cb => cb.value);
     let okCount = 0, errCount = 0;
+    const dispatchedOk = [];   // panels whose job actually launched — these get watched to completion
     const promises = [];
 
     for (const id of ids) {
@@ -462,6 +463,7 @@ function runBulk(type) {
                 if (ok) {
                     if (row) { row.style.opacity = '1'; row.style.borderLeft = '4px solid var(--accent-green)'; }
                     okCount++;
+                    dispatchedOk.push(id);
                 } else {
                     if (row) { row.style.opacity = '1'; row.style.borderLeft = '4px solid var(--accent-orange)'; }
                     errCount++;
@@ -478,14 +480,111 @@ function runBulk(type) {
     }
 
     Promise.all(promises).then(() => {
-        const verb = BUILD_OPS.includes(action) ? 'kicked off' : 'dispatched';
+        // Build ops (create/update/delete) only DISPATCH here — the real work runs
+        // detached on each host. Watch each launched panel to completion instead of
+        // a blind reload, so the dashboard live-updates per row.
+        if (BUILD_OPS.includes(action)) {
+            if (dispatchedOk.length === 0) {
+                showToast('error', `No panels dispatched (${errCount} failed). Nothing to watch.`);
+                setTimeout(() => location.reload(), 4000);
+                return;
+            }
+            showToast(errCount === 0 ? 'success' : 'error',
+                errCount === 0
+                    ? `${okCount} job(s) launched — watching for completion…`
+                    : `${okCount} launched, ${errCount} failed to dispatch. Watching the launched ones…`);
+            watchBulkCompletion(dispatchedOk, type, action);
+            return;
+        }
+
+        // Daemon ops (start/stop/restart) are synchronous — just reload.
         if (errCount === 0) {
-            showToast('success', `${okCount} panel(s) ${verb}. Reloading in 3s...`);
+            showToast('success', `${okCount} panel(s) dispatched. Reloading in 3s...`);
         } else {
-            showToast('error',   `${okCount} ${verb}, ${errCount} failed. Check rows highlighted in red/orange. Reloading in 5s...`);
+            showToast('error',   `${okCount} dispatched, ${errCount} failed. Check rows highlighted in red/orange. Reloading in 5s...`);
         }
         setTimeout(() => location.reload(), errCount === 0 ? 3000 : 5000);
     });
+}
+
+// --- BULK COMPLETION WATCHER ---
+// Polls task_status per launched panel until each drops its terminal marker,
+// updating a small per-row chip live. Reuses the same endpoint the per-panel
+// page uses, so statuses self-correct on the dashboard without opening each panel.
+function setRowChip(id, text, kind) {
+    const palette = {
+        run:  { bg: 'rgba(251,146,60,.15)', fg: 'var(--accent-orange)' },
+        ok:   { bg: 'rgba(34,211,238,.15)', fg: 'var(--accent-green)' },
+        fail: { bg: 'rgba(248,113,113,.15)', fg: 'var(--accent-red)' },
+    }[kind] || {};
+    const row = document.getElementById('row-' + id);
+    if (!row || !row.cells[1]) return;
+    let chip = document.getElementById('bulkchip-' + id);
+    if (!chip) {
+        chip = document.createElement('span');
+        chip.id = 'bulkchip-' + id;
+        chip.style.cssText = 'display:inline-block;margin-top:4px;font-family:var(--font-mono);font-size:10px;font-weight:600;padding:2px 8px;border-radius:6px;';
+        row.cells[1].appendChild(chip);
+    }
+    chip.textContent = text;
+    chip.style.background = palette.bg || 'transparent';
+    chip.style.color = palette.fg || 'inherit';
+}
+
+function watchBulkCompletion(ids, type, action) {
+    const everyMs = 6000;
+    const maxMs   = 20 * 60 * 1000;
+    const started = Date.now();
+    const csrf    = window.__CSRF__;
+    const pending = new Set(ids);
+    let done = 0, failed = 0;
+
+    ids.forEach(id => {
+        setRowChip(id, 'Working…', 'run');
+        const row = document.getElementById('row-' + id);
+        if (row) row.style.borderLeft = '4px solid var(--accent-orange)';
+    });
+
+    const reloadSoon = () => setTimeout(() => location.reload(), 3000);
+
+    const pollOne = async (id) => {
+        try {
+            const res = await fetch(`ajax_service_handler.php?id=${id}&ajax=task_status&type=${type}`, {
+                headers: { 'X-CSRF-Token': csrf }
+            });
+            const data = await res.json();
+            if (data.status === 'success' && data.done) {
+                pending.delete(id);
+                const row = document.getElementById('row-' + id);
+                if (data.state === 'error') {
+                    failed++;
+                    setRowChip(id, 'Failed', 'fail');
+                    if (row) row.style.borderLeft = '4px solid var(--accent-red)';
+                } else {
+                    done++;
+                    setRowChip(id, data.state === 'removed' ? 'Removed' : 'Done', 'ok');
+                    if (row) row.style.borderLeft = '4px solid var(--accent-green)';
+                }
+            }
+        } catch (e) { /* transient SSH/network hiccup — keep watching */ }
+    };
+
+    const tick = async () => {
+        if (Date.now() - started > maxMs) {
+            showToast('error', `${pending.size} panel(s) still running after a long time. Reloading to recheck…`);
+            reloadSoon();
+            return;
+        }
+        await Promise.all(Array.from(pending).map(pollOne));
+        if (pending.size === 0) {
+            showToast(failed === 0 ? 'success' : 'error',
+                `Bulk ${action.toUpperCase()}: ${done} completed${failed ? ', ' + failed + ' failed' : ''}. Reloading…`);
+            reloadSoon();
+            return;
+        }
+        setTimeout(tick, everyMs);
+    };
+    setTimeout(tick, everyMs);
 }
 
 document.addEventListener('DOMContentLoaded', () => {

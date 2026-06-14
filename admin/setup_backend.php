@@ -82,7 +82,12 @@ if (!$panel) {
 //   • every action needs to reach the box + know which unit to control
 //   • create/update need the repo URL
 //   • only create writes the systemd unit, so only create needs the DB creds
-$required = ['be_server_ip', 'be_ssh_user', 'be_ssh_pass', 'be_service'];
+$required = ['be_server_ip', 'be_ssh_user', 'be_ssh_pass'];
+if (in_array($action, ['update', 'delete'], true)) {
+    // update/delete act on an EXISTING unit, so the service name must already exist.
+    // create derives one from the domain if it's blank (e.g. after a delete cleared it).
+    $required[] = 'be_service';
+}
 if (in_array($action, ['create', 'update'], true)) {
     $required[] = 'be_git_url';
 }
@@ -136,8 +141,14 @@ $domain   = $panel['domain'];
 // already (e.g. "somani-one.service") we strip it here — otherwise the file
 // lands at /etc/systemd/system/somani-one.service.service and
 // `systemctl enable somani-one.service` fails to find it.
-$service  = preg_replace('/[^A-Za-z0-9._-]/', '', $panel['be_service']) ?: 'vormox-backend';
-$service  = preg_replace('/\.service$/i', '', $service);
+$service = trim((string) $panel['be_service']);
+$service = preg_replace('/\.service$/i', '', $service);           // strip suffix if admin typed it
+$service = preg_replace('/[^A-Za-z0-9._-]/', '', $service);        // sanitize
+if ($service === '') {
+    // Blank (e.g. a prior delete cleared it) → derive be-<domain>, mirroring setup_frontend.php.
+    $service = 'be-' . preg_replace('/[^A-Za-z0-9]+/', '-', strtolower($domain));
+    $service = trim($service, '-') ?: ('be-panel-' . $panel_id);
+}
 
 // ---------------------------------------------------------------------------
 // Shared script header — lock, logging, fail()/run() helpers.
@@ -198,7 +209,7 @@ log "==========================================="
 log "Starting backend setup for \$DOMAIN"
 log "Service: \$SERVICE   |   Working dir: \$BACKEND_DIR"
 log "==========================================="
-
+run "systemctl daemon-reload"
 # Step 1: prerequisites (apt update → upgrade → timezone → build deps)
 log ""
 log ">>> Step 1/5: system prep + install prerequisites"
@@ -447,7 +458,14 @@ if (!@ssh2_auth_password($conn, $panel['be_ssh_user'], $panel['be_ssh_pass'])) {
 // Mark installing BEFORE kickoff for create/update — the UI status flips
 // immediately, and if the kickoff itself fails it stays "installing" (a useful
 // stuck-signal). Delete leaves the stored status untouched (mirrors frontend).
-if (in_array($action, ['create', 'update'], true)) {
+if ($action === 'create') {
+    // Persist the (possibly derived) service name so start/stop/logs/update/delete
+    // can find the unit — parallels setup_frontend.php writing fe_service on create.
+    try {
+        $pdo->prepare("UPDATE panel_details SET be_service = ?, be_status = 'installing' WHERE panel_id = ?")
+            ->execute([$service, $panel_id]);
+    } catch (PDOException $e) { /* non-fatal */ }
+} elseif ($action === 'update') {
     try {
         $pdo->prepare("UPDATE panel_details SET be_status = 'installing' WHERE panel_id = ?")
             ->execute([$panel_id]);
@@ -474,7 +492,11 @@ if ($pstream) {
 }
 
 // Write the script, then nohup it. Detach all stdio so ssh2_exec returns fast.
+// Remove any stale status marker FIRST — the completion poller treats the
+// marker's presence as "this run finished", so it must not survive a prior run.
+$status_file = escapeshellarg("/var/log/vormox/{$domain}-task.status");
 $kickoff = "mkdir -p /var/log/vormox && "
+        . "rm -f {$status_file} && "
         . "printf '%s' '{$b64}' | base64 -d > {$script_path} && "
         . "chmod +x {$script_path} && "
         . "(nohup bash {$script_path} </dev/null >/dev/null 2>&1 &)";

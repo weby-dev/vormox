@@ -224,6 +224,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['ajax_action'])) {
 }
 
 // ==========================================
+// 4b. TASK COMPLETION CHECK (GET)
+//   The setup_* scripts drop a terminal marker (installed / error / removed) at
+//   /var/log/vormox/<domain>[-fe]-task.status when a create/update/delete run
+//   finishes. The kickoff removes any stale marker first, so "no file yet" means
+//   the job is still running. This endpoint reads that marker, reflects the final
+//   state into panel_details, and tells the UI whether it can stop polling.
+// ==========================================
+if (isset($_GET['ajax']) && $_GET['ajax'] === 'task_status') {
+    $type = filter_input(INPUT_GET, 'type', FILTER_SANITIZE_SPECIAL_CHARS);
+    $side = ($type === 'be') ? 'be' : (($type === 'fe') ? 'fe' : null);
+    if (!$side) {
+        echo json_encode(['status' => 'error', 'message' => 'Unknown service type.', 'done' => false]); exit;
+    }
+
+    $ip   = $panel["{$side}_server_ip"];
+    $port = $panel["{$side}_ssh_port"];
+    $user = $panel["{$side}_ssh_user"];
+    $pass = $panel["{$side}_ssh_pass"];
+    if (empty($ip) || empty($user)) {
+        echo json_encode(['status' => 'error', 'message' => 'Missing SSH credentials for ' . strtoupper($side) . '.', 'done' => false]); exit;
+    }
+
+    $suffix      = ($side === 'fe') ? '-fe-task.status' : '-task.status';
+    $status_file = escapeshellarg('/var/log/vormox/' . $panel['domain'] . $suffix);
+    $cmd = "cat {$status_file} 2>/dev/null || echo RUNNING";
+    $ssh = execute_ssh_command($ip, $port, $user, $pass, $cmd);
+
+    if (!$ssh['success']) {
+        // Host unreachable / transient — let the UI keep polling rather than fail.
+        echo json_encode(['status' => 'error', 'state' => 'unknown', 'done' => false, 'message' => $ssh['output']]); exit;
+    }
+
+    $marker = strtolower(trim((string) $ssh['output']));
+    if (strpos($marker, 'installed') !== false)  { $state = 'installed'; }
+    elseif (strpos($marker, 'removed') !== false) { $state = 'removed'; }
+    elseif (strpos($marker, 'error') !== false)   { $state = 'error'; }
+    else                                          { $state = 'running'; }
+
+    // Reflect terminal states into the DB so badges + the panels dashboard match reality.
+    $status_col  = ($side === 'be') ? 'be_status' : 'fe_status';
+    $service_col = ($side === 'be') ? 'be_service' : 'fe_service';
+    $db_state = ['installed' => 'online', 'error' => 'error', 'removed' => 'offline'][$state] ?? null;
+    try {
+        if ($state === 'removed') {
+            // Delete tore down the systemd unit on the host — drop the service mapping
+            // too, so the card shows the "not deployed" state instead of a phantom
+            // OFFLINE service. Server IP + SSH creds are kept so it can be re-created.
+            $pdo->prepare("UPDATE panel_details SET {$status_col} = 'offline', {$service_col} = NULL WHERE panel_id = ?")
+                ->execute([$panel_id]);
+        } elseif ($db_state !== null) {
+            $pdo->prepare("UPDATE panel_details SET {$status_col} = ? WHERE panel_id = ?")
+                ->execute([$db_state, $panel_id]);
+        }
+    } catch (PDOException $e) { /* non-fatal */ }
+
+    echo json_encode([
+        'status'   => 'success',
+        'state'    => $state,
+        'done'     => in_array($state, ['installed', 'error', 'removed'], true),
+        'db_state' => $db_state,
+    ]);
+    exit;
+}
+
+// ==========================================
 // 5. REAL-TIME LOG POLLING (GET)
 // ==========================================
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'logs') {
