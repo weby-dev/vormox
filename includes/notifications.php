@@ -223,3 +223,29 @@ function notify_email_verification_otp($email, $firstName, $otp, $minutesValid =
 
     return vormox_send_mail($email, $firstName, 'Your Vormox verification code', $html);
 }
+
+/**
+ * One-time code gating a backup download. Sent when a user requests to
+ * download one of their database backups from the dashboard.
+ */
+function notify_backup_download_otp($email, $firstName, $otp, $minutesValid = 10) {
+    if (empty($email) || empty($otp)) return false;
+
+    $body  = vormox_email_hero(
+        $firstName,
+        'Backup Download',
+        'Confirm your backup download',
+        "Enter this 6-digit code on the backups screen to download your database backup.",
+        'purple'
+    );
+    $body .= vormox_email_code($otp);
+    $body .= vormox_email_footnote("Code expires in {$minutesValid} minutes. If you didn't request this download, ignore this email and consider changing your password.");
+
+    $html = vormox_email_template(
+        'Your Vormox backup download code',
+        $body,
+        "Backup download code: {$otp}"
+    );
+
+    return vormox_send_mail($email, $firstName, 'Your Vormox backup download code', $html);
+}

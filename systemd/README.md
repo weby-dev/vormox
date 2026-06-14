@@ -126,6 +126,13 @@ nicer.
 
 # Hourly — renewal reminders + suspension sweep
 0 * * * *   /usr/bin/php /root/vormox/cron/suspend_expired.php      >> /var/log/vormox-cron.log 2>&1
+
+# Daily 03:00 — auto-renew paid panels / generate renewal invoices
+0 3 * * *   /usr/bin/php /root/vormox/cron/auto_renew_invoices.php  >> /var/log/vormox-cron.log 2>&1
+
+# Twice daily 02:00 & 14:00 — per-panel MySQL backup → S3 (+ email copy).
+# Needs the S3_* keys in .env; 12h apart, offset from the 03:00 renew job.
+0 2,14 * * * /usr/bin/php /root/vormox/cron/db_backup.php           >> /var/log/vormox-cron.log 2>&1
 ```
 
 ### Systemd timers (if you prefer)

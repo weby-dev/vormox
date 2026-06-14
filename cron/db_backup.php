@@ -22,8 +22,13 @@
 // Per-script timeout: 12 minutes (Bash + mysqldump + xz extreme can be slow).
 
 require_once __DIR__ . '/_bootstrap.php';
+require_once __DIR__ . '/../includes/s3_client.php';
+require_once __DIR__ . '/../includes/backup_store.php';
 
 cron_log("== db_backup start ==");
+if (!s3_configured()) {
+    cron_log("WARNING: S3 not configured (S3_* env) — backups will email only, not upload to S3.");
+}
 
 // --- Admin recipients come from the admins table -------------------------
 // Every row in `admins` gets a copy of every backup (alongside the panel's
@@ -102,14 +107,55 @@ foreach ($panels as $p) {
     $customer_name = trim(($p['first_name'] ?? '') . ' ' . ($p['last_name'] ?? '')) ?: 'Customer';
     $recipients[] = ['addr' => $p['user_email'], 'name' => $customer_name];
 
-    $script  = vormox_render_backup_script($p, $recipients, $zepto_key, $from_email, $from_name);
+    // Deterministic timestamp + S3 key so PHP knows exactly where the dump lands.
+    $ts     = date('Y-m-d_H-i-s');
+    $s3_key = backup_object_key($p['domain'], $p['db_name'], $ts);
+    $sub    = backup_subscription_folder($p['domain']);
+
+    // Track this backup in the DB (pending → uploaded|failed).
+    $backup_id = null;
+    try {
+        $ins = $pdo->prepare("
+            INSERT INTO backups (panel_id, user_id, subscription, db_name, s3_key, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+        ");
+        $ins->execute([$p['id'], $p['user_id'], $sub, $p['db_name'], $s3_key]);
+        $backup_id = (int) $pdo->lastInsertId();
+    } catch (PDOException $e) {
+        cron_log("  · {$tag} could not record backup row: " . $e->getMessage());
+    }
+
+    // Presigned PUT URL — the backend host uploads straight to S3 with this, so
+    // the S3 secret never leaves the web server. Expiry covers dump + upload.
+    $put_url = s3_configured() ? s3_presign_put($s3_key, $per_script_timeout + 600) : '';
+
+    $script  = vormox_render_backup_script($p, $recipients, $zepto_key, $from_email, $from_name, $ts, $put_url);
     $outcome = vormox_run_remote_backup($p, $script, $per_script_timeout);
 
-    if ($outcome['ok']) {
-        cron_log("  ✓ {$tag} backup sent. " . $outcome['summary']);
+    // S3 HEAD is the authoritative check that the object actually landed.
+    $head = s3_configured() ? s3_head($s3_key) : ['exists' => false, 'size' => 0];
+
+    if ($head['exists']) {
+        if ($backup_id) {
+            $pdo->prepare("UPDATE backups SET status='uploaded', size_bytes=?, uploaded_at=NOW() WHERE id=?")
+                ->execute([$head['size'], $backup_id]);
+        }
+        cron_log("  ✓ {$tag} in S3 ({$s3_key}, " . backup_human_size($head['size']) . "). " . $outcome['summary']);
         $ok++;
+        // Retention: keep newest 7 per subscription in S3 (+ prune their DB rows).
+        try {
+            $pr = backup_prune_subscription($pdo, $sub, 7);
+            if (!empty($pr['pruned'])) cron_log("    · pruned {$pr['pruned']} old S3 backup(s) for {$sub}");
+        } catch (Throwable $e) {
+            cron_log("    · prune error for {$sub}: " . $e->getMessage());
+        }
     } else {
-        cron_log("  ✗ {$tag} backup FAILED: " . $outcome['summary']);
+        if ($backup_id) {
+            $err = $outcome['ok'] ? 'S3 object not found after run' : $outcome['summary'];
+            $pdo->prepare("UPDATE backups SET status='failed', error=? WHERE id=?")
+                ->execute([substr($err, 0, 1000), $backup_id]);
+        }
+        cron_log("  ✗ {$tag} backup FAILED (S3): " . ($outcome['ok'] ? 'object missing after run' : $outcome['summary']));
         $failed++;
     }
 }
@@ -131,7 +177,7 @@ exit($failed > 0 ? 1 : 0);
  * All credentials get base64'd onto the wire so password special chars
  * ($, !, ", `, etc.) can't break shell quoting.
  */
-function vormox_render_backup_script(array $p, array $recipients, string $zepto_key, string $from_email, string $from_name): string
+function vormox_render_backup_script(array $p, array $recipients, string $zepto_key, string $from_email, string $from_name, string $ts, string $s3_put_url): string
 {
     // Build the JSON "to" array fragment — assembled bash-side from a base64'd JSON.
     $to_json = [];
@@ -158,6 +204,8 @@ function vormox_render_backup_script(array $p, array $recipients, string $zepto_
     $BACKUP_DIR = $sh("/var/backups/vormox/{$panel_id}");
     $LOG_FILE   = $sh("/var/log/vormox/{$domain_safe}-backup.log");
     $TO_B64     = $sh($to_b64);
+    $TS_FIXED   = $sh($ts);
+    $S3_PUT_URL = $sh($s3_put_url);
 
     // Note: the user's original script's tail-check looked for "Dump completed"
     // OR foreign-key-checks restore — keep that liberal check.
@@ -178,12 +226,13 @@ ZEPTO_API_KEY={$ZEPTO_KEY}
 FROM_EMAIL={$FROM_EMAIL}
 FROM_NAME={$FROM_NAME}
 TO_RECIPIENTS_B64={$TO_B64}
+S3_PUT_URL={$S3_PUT_URL}
 
 BACKUP_DIR={$BACKUP_DIR}
 LOG_FILE={$LOG_FILE}
 MAX_EMAIL_BYTES=\$((14 * 1024 * 1024))
 
-TIMESTAMP=\$(date +"%Y-%m-%d_%H-%M-%S")
+TIMESTAMP={$TS_FIXED}
 RAW_FILE="\${BACKUP_DIR}/\${DB_NAME}_\${TIMESTAMP}.sql"
 BACKUP_FILE="\${RAW_FILE}.xz"
 HOSTNAME_TXT=\$(hostname)
@@ -331,6 +380,21 @@ xz -t "\$BACKUP_FILE" || on_error "Compressed file failed integrity test"
 FINAL_SIZE_BYTES=\$(stat -c%s "\$BACKUP_FILE")
 FINAL_SIZE=\$(du -h "\$BACKUP_FILE" | cut -f1)
 log "Compressed: \$BACKUP_FILE (\$FINAL_SIZE)"
+
+# 4b. Upload to S3 (presigned PUT). Non-fatal: the email copy still goes out,
+# and the web server confirms the object via HEAD after this script returns.
+if [[ -n "\$S3_PUT_URL" ]]; then
+    log "Uploading to S3..."
+    S3_CODE=\$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -T "\$BACKUP_FILE" \\
+        -H "Content-Type: application/x-xz" "\$S3_PUT_URL" 2>>"\$LOG_FILE" || echo "000")
+    if [[ "\$S3_CODE" =~ ^2 ]]; then
+        log "S3 upload OK (HTTP \$S3_CODE)"
+    else
+        log "WARNING: S3 upload failed (HTTP \$S3_CODE) — email copy still sent"
+    fi
+else
+    log "S3 not configured — skipping upload (email only)"
+fi
 
 # 5. Email
 EMAIL_BODY="<h3>✅ Database Backup Successful</h3>

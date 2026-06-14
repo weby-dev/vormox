@@ -478,6 +478,7 @@ $page_title = 'Client Hub: ' . $user['first_name'];
     
     <a href="users.php" class="nav-item active"><i class="fa-solid fa-users"></i> Users & Clients</a>
     <a href="panels.php" class="nav-item"><i class="fa-solid fa-server"></i> Provisioned Panels</a>
+    <a href="backups.php" class="nav-item <?= $current_page == 'backups.php' ? 'active' : '' ?>"><i class="fa-solid fa-clock-rotate-left"></i> Backups</a>
     
     <div class="nav-label">Financial</div>
     <a href="invoices.php" class="nav-item"><i class="fa-solid fa-file-invoice-dollar"></i> Invoices</a>

@@ -35,7 +35,7 @@
     <a href="invoices.php" class="nav-item <?= in_array($current_page, ['invoices.php', 'view-invoice.php']) ? 'active' : '' ?>">
       <i class="fa-solid fa-credit-card"></i> Billing
     </a>
-    <a href="#" class="nav-item">
+    <a href="backups.php" class="nav-item <?= $current_page == 'backups.php' ? 'active' : '' ?>">
       <i class="fa-solid fa-clock-rotate-left"></i> Backups
     </a>
     <a href="#" class="nav-item">

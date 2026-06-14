@@ -205,6 +205,7 @@ $page_title = 'Access Security';
     
     <a href="users.php" class="nav-item <?= $current_page == 'users.php' ? 'active' : '' ?>"><i class="fa-solid fa-users"></i> Users & Clients</a>
     <a href="panels.php" class="nav-item <?= in_array($current_page, ['panels.php', 'manage_panel.php']) ? 'active' : '' ?>"><i class="fa-solid fa-server"></i> Provisioned Panels</a>
+    <a href="backups.php" class="nav-item <?= $current_page == 'backups.php' ? 'active' : '' ?>"><i class="fa-solid fa-clock-rotate-left"></i> Backups</a>
     
     <div class="nav-label">Financial</div>
     <a href="invoices.php" class="nav-item <?= in_array($current_page, ['invoices.php', 'view-invoice.php']) ? 'active' : '' ?>"><i class="fa-solid fa-file-invoice-dollar"></i> Invoices</a>
